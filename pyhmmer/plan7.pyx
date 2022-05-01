@@ -206,6 +206,31 @@ cdef class Alignment:
     def __len__(self):
         return self.hmm_to - self.hmm_from
 
+    def __str__(self):
+        assert self._ad != NULL
+
+        cdef int    status
+        cdef object buffer = io.BytesIO()
+        cdef FILE*  fp     = fopen_obj(buffer, "w")
+
+        try:
+            status = libhmmer.p7_alidisplay.p7_nontranslated_alidisplay_Print(
+                fp,
+                self._ad,
+                0,
+                -1,
+                False,
+            )
+            if status == libeasel.eslEWRITE:
+                raise OSError("Failed to write alignment")
+            elif status != libeasel.eslOK:
+                raise UnexpectedError(status, "p7_alidisplay_Print")
+        finally:
+            fclose(fp)
+
+        return buffer.getvalue().decode("ascii")
+
+
     # --- Properties ---------------------------------------------------------
 
     @property
@@ -993,7 +1018,7 @@ cdef class Cutoffs:
         c._owner = self._owner
         return c
 
-    def __str__(self):
+    def __repr__(self):
         ty = type(self).__name__
         return "<Pfam score cutoffs of {!r}>".format(
             self._owner,
@@ -1403,7 +1428,7 @@ cdef class EvalueParameters:
         ev._evparams = self._evparams
         return ev
 
-    def __str__(self):
+    def __repr__(self):
         ty = type(self).__name__
         return "<e-value parameters of {!r}>".format(
             self._owner,
@@ -1682,7 +1707,7 @@ cdef class Hit:
         selecting hits during an iterative search performed by
         `Pipeline.iterate_seq`.
 
-        .. versionadded:: 0.5.1
+        .. versionadded:: 0.6.0
 
         """
         if self.is_included():
@@ -1698,7 +1723,7 @@ cdef class Hit:
         multiple sequence alignment from the `TopHits` object, even if it
         was under inclusion thresholds.
 
-        .. versionadded:: 0.5.1
+        .. versionadded:: 0.6.0
 
         """
         if not self.is_included():
@@ -2287,7 +2312,7 @@ cdef class HMM:
 
                 >>> hmm = HMM(100, alphabet=easel.Alphabet.dna())
                 >>> hmm.match_emissions[0]
-                VectorF([1.0, 0.0, 0.0, 0.0])
+                pyhmmer.easel.VectorF([1.0, 0.0, 0.0, 0.0])
 
         Caution:
             If editing this matrix manually, note that rows must contain
@@ -2471,7 +2496,7 @@ cdef class HMM:
 
     @property
     def evalue_parameters(self):
-        """`~plan7.EvalueParameters`: The e-value parameters for this HMM.
+        """`EvalueParameters`: The e-value parameters for this HMM.
         """
         assert self._hmm != NULL
         cdef EvalueParameters ep = EvalueParameters.__new__(EvalueParameters)
@@ -2481,7 +2506,7 @@ cdef class HMM:
 
     @property
     def cutoffs(self):
-        """`~pyhmmer.plan7.Cutoffs`: The bitscore cutoffs for this HMM.
+        """`Cutoffs`: The bitscore cutoffs for this HMM.
         """
         assert self._hmm != NULL
         cdef Cutoffs cutoffs = Cutoffs.__new__(Cutoffs)
@@ -2901,6 +2926,7 @@ cdef class HMMFile:
 
         self._alphabet = Alphabet.__new__(Alphabet)
         self._alphabet._abc = NULL
+        self._file = file
 
     def __dealloc__(self):
         if self._hfp:
@@ -2921,6 +2947,12 @@ cdef class HMMFile:
         if hmm is None:
             raise StopIteration()
         return hmm
+
+    def __repr__(self):
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        return f"{mod}.{name}({self._file!r}, db={self.is_pressed()!r})"
 
     # --- Properties ---------------------------------------------------------
 
@@ -3732,7 +3764,7 @@ cdef class Offsets:
         copy._owner = self._owner
         return copy
 
-    def __str__(self):
+    def __repr__(self):
         ty = type(self).__name__
         return "<offsets of {!r} model={!r} filter={!r} profile={!r}>".format(
             self._owner,
@@ -4483,6 +4515,8 @@ cdef class Pipeline:
             >>> plan7.Pipeline(alphabet, F1=0.01).arguments()
             ['--F1', '0.01']
 
+        .. versionadded:: 0.6.0
+
         """
         cdef list argv = []
         cdef str  cutoff
@@ -5174,7 +5208,7 @@ cdef class Pipeline:
                 ...     if iteration.converged:
                 ...         break
 
-        .. versionadded:: 0.5.1
+        .. versionadded:: 0.6.0
 
         """
         # collect target sequences into an optimized structure
@@ -5362,6 +5396,8 @@ cdef class LongTargetsPipeline(Pipeline):
             []
             >>> plan7.LongTargetsPipeline(alphabet, B1=200).arguments()
             ['--B1', '200']
+
+        .. versionadded:: 0.6.0
 
         """
         cdef list argv = []
@@ -6518,6 +6554,8 @@ cdef class TopHits:
         Returns:
             `int`: The number of new hits found in this iteration.
 
+        .. versionadded:: 0.6.0
+
         """
         assert self._th != NULL
         assert ranking._kh != NULL
@@ -6585,7 +6623,7 @@ cdef class TopHits:
         bint digitize=False,
         bint all_consensus_cols=False
     ):
-        """to_msa(self, alphabet, *, trim=False, digitize=False, all_consensus_cols=False)\n--
+        """to_msa(self, alphabet, *, sequences=None, traces=None, trim=False, digitize=False, all_consensus_cols=False)\n--
 
         Create multiple alignment of all included domains.
 
@@ -6615,7 +6653,7 @@ cdef class TopHits:
 
         .. versionadded:: 0.3.0
 
-        .. versionchanged:: 0.5.1
+        .. versionchanged:: 0.6.0
            Added the ``sequences`` and ``traces`` arguments.
 
         """
@@ -6781,7 +6819,7 @@ cdef class Trace:
 
         Create a faux trace from a single sequence.
 
-        .. versionadded:: 0.5.1
+        .. versionadded:: 0.6.0
 
         """
         cdef int   i

@@ -115,6 +115,10 @@ cdef dict MSA_FILE_FORMATS = {
     "phylips": libeasel.msafile.eslMSAFILE_PHYLIPS,
 }
 
+cdef dict MSA_FILE_FORMATS_INDEX = {
+    v:k for k,v in MSA_FILE_FORMATS.items()
+}
+
 cdef dict SEQUENCE_FILE_FORMATS = {
     "fasta": libeasel.sqio.eslSQFILE_FASTA,
     "embl": libeasel.sqio.eslSQFILE_EMBL,
@@ -128,6 +132,9 @@ cdef dict SEQUENCE_FILE_FORMATS = {
     **MSA_FILE_FORMATS,
 }
 
+cdef dict SEQUENCE_FILE_FORMATS_INDEX = {
+    v:k for k,v in SEQUENCE_FILE_FORMATS.items()
+}
 
 # --- Alphabet ---------------------------------------------------------------
 
@@ -207,14 +214,20 @@ cdef class Alphabet:
 
     def __repr__(self):
         assert self._abc != NULL
+
+        cdef type   ty   = type(self)
+        cdef str    name = ty.__name__
+        cdef str    mod  = ty.__module__
+
         if self._abc.type == libeasel.alphabet.eslRNA:
-            return "Alphabet.rna()"
+            return f"{mod}.{name}.rna()"
         elif self._abc.type == libeasel.alphabet.eslDNA:
-            return "Alphabet.dna()"
+            return f"{mod}.{name}.dna()"
         elif self._abc.type == libeasel.alphabet.eslAMINO:
-            return "Alphabet.amino()"
+            return f"{mod}.{name}.amino()"
         else:
-            return "Alphabet({!r}, K={!r}, Kp={!r})".format(
+            return "{}.{name}({!r}, K={!r}, Kp={!r})".format(
+                mod,
                 self._abc.sym.decode('ascii'),
                 self._abc.K,
                 self._abc.Kp
@@ -926,7 +939,10 @@ cdef class Vector:
             buffer.internal = NULL
 
     def __repr__(self):
-        return f"{type(self).__name__}({list(self)!r})"
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        return f"{mod}.{name}({list(self)!r})"
 
     def __sizeof__(self):
         return self._n * self.itemsize + sizeof(self)
@@ -1072,36 +1088,36 @@ cdef class VectorF(Vector):
         3.0
         >>> v[0] = v[-1] = 4.0
         >>> v
-        VectorF([4.0, 2.0, 4.0])
+        pyhmmer.easel.VectorF([4.0, 2.0, 4.0])
 
     Slices are also supported, and they do not copy data (use the
     `~pyhmmer.easel.VectorF.copy` method to allocate a new vector)::
 
-        >>> v = VectorF(range(10))
+        >>> v = VectorF(range(6))
         >>> v[2:5]
-        VectorF([2.0, 3.0, 4.0])
-        >>> v[5:-1] = 10.0
+        pyhmmer.easel.VectorF([2.0, 3.0, 4.0])
+        >>> v[2:-1] = 10.0
         >>> v
-        VectorF([0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0, 10.0, 9.0])
+        pyhmmer.easel.VectorF([0.0, 1.0, 10.0, 10.0, 10.0, 5.0])
 
     Addition and multiplication is supported for scalars, in place or not::
 
         >>> v = VectorF([1.0, 2.0, 3.0])
         >>> v += 1
         >>> v
-        VectorF([2.0, 3.0, 4.0])
+        pyhmmer.easel.VectorF([2.0, 3.0, 4.0])
         >>> v * 3
-        VectorF([6.0, 9.0, 12.0])
+        pyhmmer.easel.VectorF([6.0, 9.0, 12.0])
 
     Pairwise operations can also be performed, but only on vectors of
     the same dimension and precision::
 
         >>> v = VectorF([1.0, 2.0, 3.0])
         >>> v * v
-        VectorF([1.0, 4.0, 9.0])
+        pyhmmer.easel.VectorF([1.0, 4.0, 9.0])
         >>> v += VectorF([3.0, 4.0, 5.0])
         >>> v
-        VectorF([4.0, 6.0, 8.0])
+        pyhmmer.easel.VectorF([4.0, 6.0, 8.0])
         >>> v *= VectorF([1.0])
         Traceback (most recent call last):
           ...
@@ -2062,7 +2078,10 @@ cdef class Matrix:
 
     def __repr__(self):
         cdef Vector row
-        return f"{type(self).__name__}({[list(row) for row in self]!r})"
+        cdef type   ty   = type(self)
+        cdef str    name = ty.__name__
+        cdef str    mod  = ty.__module__
+        return f"{mod}.{name}({[list(row) for row in self]!r})"
 
     def __sizeof__(self):
         return (
@@ -2202,14 +2221,14 @@ cdef class MatrixF(Matrix):
         >>> m = MatrixF.zeros(2, 2)
         >>> m[0, 0] = 3.0
         >>> m
-        MatrixF([[3.0, 0.0], [0.0, 0.0]])
+        pyhmmer.easel.MatrixF([[3.0, 0.0], [0.0, 0.0]])
 
     Indexing can also be performed at the row-level to get a `VectorF`
     without copying the underlying data::
 
         >>> m = MatrixF([ [1.0, 2.0], [3.0, 4.0] ])
         >>> m[0]
-        VectorF([1.0, 2.0])
+        pyhmmer.easel.VectorF([1.0, 2.0])
 
     Objects of this type support the buffer protocol, and can be viewed
     as a `numpy.ndarray` with two dimensions using the `numpy.asarray`
@@ -3765,6 +3784,10 @@ cdef class MSAFile:
         else:
             status = libeasel.msafile.esl_msafile_Open(NULL, fspath, NULL, fmt, NULL, &self._msaf)
 
+        # store a reference to the argument
+        self._file = file
+
+        # configure the new instance
         try:
             # check opening the file was successful
             if status == libeasel.eslENOTFOUND:
@@ -3810,6 +3833,16 @@ cdef class MSAFile:
             raise StopIteration()
         return msa
 
+    def __repr__(self):
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        cdef list args = [repr(self._file), repr(self.format)]
+        if self.digital:
+            args.append(f"digital={self.digital}")
+            args.append(f"alphabet={self.alphabet!r}")
+        return f"{mod}.{name}({', '.join(args)})"
+
     # --- Properties ---------------------------------------------------------
 
     @property
@@ -3823,6 +3856,14 @@ cdef class MSAFile:
         """`bool`: Whether the `MSAFile` is in digital mode or not.
         """
         return self.alphabet is not None
+
+    @property
+    def format(self):
+        """`str`: The format of the `MSAFile`.
+        """
+        if self._msaf == NULL:
+            raise ValueError("I/O operation on closed file.")
+        return MSA_FILE_FORMATS_INDEX[self._msaf.format]
 
     # --- Utils --------------------------------------------------------------
 
@@ -3969,6 +4010,13 @@ cdef class Randomness:
     def __reduce__(self):
         state = self.getstate()
         return Randomness, (state[0], state[1]), state
+
+    def __repr__(self):
+        assert self._rng != NULL
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        return f"{mod}.{name}({self._rng.seed!r}, fast={self.is_fast()!r})"
 
     def __getstate__(self):
         return self.getstate()
@@ -5139,10 +5187,25 @@ cdef class SequenceFile:
         .. versionchanged:: 0.5.0
            Added the ``digital`` and ``alphabet`` keyword arguments.
 
+        .. deprecated:: 0.6.0
+           The ``ignore_gaps`` keyword argument, use ``afa`` format instead.
+
         """
         cdef int   fmt
         cdef int   status
         cdef bytes fspath
+
+        # TODO: Remove in v0.7.0
+        if ignore_gaps:
+            warnings.warn(
+                (
+                  "`ignore_gaps` is deprecated and will be removed from future "
+                  "versions, use the aligned FASTA format ('afa') to read a "
+                  "FASTA file with gap characters."
+                ),
+                DeprecationWarning,
+                stacklevel=2
+            )
 
         # get format from string passed as input
         fmt = libeasel.sqio.eslSQFILE_UNKNOWN
@@ -5160,6 +5223,9 @@ cdef class SequenceFile:
             status = libeasel.eslOK
         else:
             status = libeasel.sqio.esl_sqfile_Open(fspath, fmt, NULL, &self._sqfp)
+
+        # store a reference to the argument
+        self._file = file
 
         # configure the file
         try:
@@ -5214,6 +5280,16 @@ cdef class SequenceFile:
             raise StopIteration()
         return seq
 
+    def __repr__(self):
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        cdef list args = [repr(self._file), repr(self.format)]
+        if self.digital:
+            args.append(f"digital={self.digital}")
+            args.append(f"alphabet={self.alphabet!r}")
+        return f"{mod}.{name}({', '.join(args)})"
+
     # --- Properties ---------------------------------------------------------
 
     @property
@@ -5230,6 +5306,14 @@ cdef class SequenceFile:
 
         """
         return self.alphabet is not None
+
+    @property
+    def format(self):
+        """`str`: The format of the `SequenceFile`.
+        """
+        if self._sqfp == NULL:
+            raise ValueError("I/O operation on closed file.")
+        return SEQUENCE_FILE_FORMATS_INDEX[self._sqfp.format]
 
     # --- Utils --------------------------------------------------------------
 
