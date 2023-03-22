@@ -7,8 +7,8 @@ Plan7
 .. automodule:: pyhmmer.plan7
 
 
-Hidden Markov Model
--------------------
+Profile HMMs
+------------
 
 HMM
 ^^^
@@ -16,17 +16,6 @@ HMM
 .. autoclass:: pyhmmer.plan7.HMM
    :special-members: __init__
    :members:
-
-HMM File
-^^^^^^^^
-
-.. autoclass:: pyhmmer.plan7.HMMFile
-   :special-members: __init__
-   :members:
-
-
-Profile
--------
 
 Profile
 ^^^^^^^
@@ -42,10 +31,29 @@ OptimizedProfile
    :special-members: __init__
    :members:
 
-Background
-^^^^^^^^^^
 
-.. autoclass:: pyhmmer.plan7.Background
+OptimizedProfileBlock
+^^^^^^^^^^^^^^^^^^^^^
+
+.. autoclass:: pyhmmer.plan7.OptimizedProfileBlock
+   :special-members: __init__
+   :members:
+
+
+HMM Files
+---------
+
+HMMFile
+^^^^^^^
+
+.. autoclass:: pyhmmer.plan7.HMMFile
+   :special-members: __init__
+   :members:
+
+HMMPressedFile
+^^^^^^^^^^^^^^
+
+.. autoclass:: pyhmmer.plan7.HMMPressedFile
    :special-members: __init__
    :members:
 
@@ -67,12 +75,22 @@ LongTargetsPipeline
   :special-members: __init__
   :members:
 
+
 Builder
 ^^^^^^^
 
 .. autoclass:: pyhmmer.plan7.Builder
   :special-members: __init__
   :members:
+
+
+Background
+^^^^^^^^^^
+
+.. autoclass:: pyhmmer.plan7.Background
+   :special-members: __init__
+   :members:
+
 
 
 Results
@@ -179,9 +197,3 @@ Offsets
 .. autoclass:: pyhmmer.plan7.Offsets
    :members:
 
-PipelineSearchTargets
-^^^^^^^^^^^^^^^^^^^^^
-
-.. autoclass:: pyhmmer.plan7.PipelineSearchTargets
-   :special-members: __init__
-   :members:

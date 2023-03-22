@@ -1,4 +1,4 @@
-pyHMMER |Stars|
+PyHMMER |Stars|
 ===============
 
 .. |Stars| image:: https://img.shields.io/github/stars/althonos/pyhmmer.svg?style=social&maxAge=3600&label=Star
@@ -10,7 +10,7 @@ pyHMMER |Stars|
 |Actions| |Coverage| |PyPI| |Bioconda| |AUR| |Wheel| |Versions| |Implementations| |License| |Source| |Mirror| |Issues| |Docs| |Changelog| |Downloads| |DOI|
 
 
-.. |Actions| image:: https://img.shields.io/github/workflow/status/althonos/pyhmmer/Test/master?logo=github&style=flat-square&maxAge=300
+.. |Actions| image:: https://img.shields.io/github/actions/workflow/status/althonos/pyhmmer/test.yml?branch=master&logo=github&style=flat-square&maxAge=300
    :target: https://github.com/althonos/pyhmmer/actions
 
 .. |GitLabCI| image:: https://img.shields.io/gitlab/pipeline/larralde/pyhmmer/master?gitlab_url=https%3A%2F%2Fgit.embl.de&logo=gitlab&style=flat-square&maxAge=600
@@ -125,12 +125,18 @@ Library
    Changelog <changes>
 
 
-Related Project
----------------
+Related Projects
+----------------
 
-If despite of all the advantages listed earlier, you would rather use HMMER through its CLI,
-this package will not be of great help. You should then check the
-`hmmer-py <https://github.com/EBI-Metagenomics/hmmer-py>`_ package developed
+Building a HMM from scratch? Then you may be interested in the `PyFAMSA <https://pypi.org/project/pyfamsa/>`_
+package, providing bindings to `FAMSA <https://github.com/refresh-bio/FAMSA>`_,
+a very fast multiple sequence aligner. In addition, you may want to trim alignments:
+in that case, consider `PytrimAl <https://pypi.org/project/pytrimal>`_, which
+wraps `trimAl 2.0 <https://github.com/inab/trimal/tree/2.0_RC>`_.
+
+If despite of all the advantages listed earlier, you would rather use HMMER
+through its CLI, this package will not be of great help. You can instead check
+the `hmmer-py <https://github.com/EBI-Metagenomics/hmmer-py>`_ package developed
 by `Danilo Horta <https://github.com/horta>`_ at the `EMBL-EBI <https://www.ebi.ac.uk>`_.
 
 

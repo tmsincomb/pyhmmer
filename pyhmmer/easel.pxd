@@ -9,13 +9,15 @@ from posix.types cimport off_t
 cimport libeasel.sq
 from libeasel.alphabet cimport ESL_ALPHABET
 from libeasel.bitfield cimport ESL_BITFIELD
+from libeasel.gencode cimport ESL_GENCODE
 from libeasel.keyhash cimport ESL_KEYHASH
 from libeasel.msa cimport ESL_MSA
 from libeasel.msafile cimport ESL_MSAFILE
 from libeasel.random cimport ESL_RANDOMNESS
-from libeasel.sq cimport ESL_SQ
+from libeasel.sq cimport ESL_SQ, ESL_SQ_BLOCK
 from libeasel.sqio cimport ESL_SQFILE
 from libeasel.ssi cimport ESL_SSI, ESL_NEWSSI
+from libeasel cimport ESL_DSQ
 
 
 # --- Alphabet ---------------------------------------------------------------
@@ -30,6 +32,26 @@ cdef class Alphabet:
     cpdef bint is_rna(self)
     cpdef bint is_amino(self)
     cpdef bint is_nucleotide(self)
+    cpdef VectorU8 encode(self, str sequence)
+    cpdef str decode(self, const ESL_DSQ[::1] sequence)
+
+
+# --- GeneticCode ------------------------------------------------------------
+
+cdef class GeneticCode:
+    cdef readonly Alphabet     amino_alphabet
+    cdef readonly Alphabet     nucleotide_alphabet
+    cdef          ESL_GENCODE* _gcode
+
+    cdef void _translate(
+        self,
+        const ESL_DSQ* seq,
+        int64_t seqlen,
+        ESL_DSQ* out,
+        int64_t outlen
+    ) nogil except *
+
+    cpdef VectorU8 translate(self, const ESL_DSQ[::1] sequence)
 
 
 # --- Bitfield ---------------------------------------------------------------
@@ -40,6 +62,7 @@ cdef class Bitfield:
 
     cdef size_t _wrap_index(self, int index) except -1
     cpdef size_t count(self, bint value=*)
+    cpdef Bitfield copy(self)
     cpdef void toggle(self, int index) except *
 
 
@@ -146,15 +169,16 @@ cdef class DigitalMSA(MSA):
 
 cdef class MSAFile:
     cdef          ESL_MSAFILE* _msaf
-    cdef          object       _file
+    cdef readonly object       _file
     cdef readonly Alphabet     alphabet
+    cdef readonly str          name
 
     @staticmethod
     cdef ESL_MSAFILE* _open_fileobj(object fh, int fmt) except NULL
-    cdef Alphabet guess_alphabet(self)
 
-    cpdef MSA read(self)
     cpdef void close(self)
+    cpdef Alphabet guess_alphabet(self)
+    cpdef MSA read(self)
 
 
 # --- Randomness -------------------------------------------------------------
@@ -163,13 +187,10 @@ cdef class Randomness:
     cdef ESL_RANDOMNESS* _rng
     cdef object          _owner
 
-    cdef int _seed(self, uint32_t n) except 1
-
     cpdef void seed(self, object n=*) except *
     cpdef Randomness copy(self)
     cpdef double random(self)
     cpdef double normalvariate(self, double mu, double sigma)
-    cpdef bint is_fast(self)
 
 
 # --- Sequence ---------------------------------------------------------------
@@ -193,24 +214,77 @@ cdef class DigitalSequence(Sequence):
 
     cpdef DigitalSequence copy(self)
     cpdef TextSequence textize(self)
+    cpdef DigitalSequence translate(self, GeneticCode genetic_code=*)
     cpdef DigitalSequence reverse_complement(self, bint inplace=*)
 
+
+# --- Sequence Block ---------------------------------------------------------
+
+cdef class SequenceBlock:
+    cdef          size_t     _length   # the number of sequences in the block
+    cdef          size_t     _capacity # the total number of sequences that can be stored
+    cdef          ESL_SQ**   _refs     # the array to pass the sequence references
+    cdef          list       _storage  # the actual Python list where `Sequence` objects are stored
+    cdef          object     _owner    # the owner, if the object is just a shallow copy
+    cdef          ssize_t    _largest  # the index of the largest sequence, or -1
+
+    cdef void _on_modification(self) except *
+
+    cdef void _allocate(self, size_t n) except *
+    cdef void _append(self, Sequence sequence) except *
+    cdef Sequence _pop(self, ssize_t index=*)
+    cdef void _insert(self, ssize_t index, Sequence sequence) except *
+    cdef size_t _index(self, Sequence sequence, ssize_t start=*, ssize_t stop=*) except *
+    cdef void _remove(self, Sequence sequence) except *
+
+    cpdef void extend(self, object iterable) except *
+    cpdef SequenceBlock copy(self)
+    cpdef void clear(self) except *
+    cpdef Sequence largest(self)
+
+
+cdef class TextSequenceBlock(SequenceBlock):
+    cpdef void append(self, TextSequence sequence) except *
+    cpdef TextSequence pop(self, ssize_t index=*)
+    cpdef void insert(self, ssize_t index, TextSequence sequence) except *
+    cpdef size_t index(self, TextSequence sequence, ssize_t start=*, ssize_t stop=*) except *
+    cpdef void remove(self, TextSequence sequence) except *
+
+    cpdef TextSequenceBlock copy(self)
+    cpdef DigitalSequenceBlock digitize(self, Alphabet alphabet)
+    cpdef TextSequence largest(self)
+
+cdef class DigitalSequenceBlock(SequenceBlock):
+    cdef readonly Alphabet   alphabet
+
+    cpdef void append(self, DigitalSequence sequence) except *
+    cpdef DigitalSequence pop(self, ssize_t index=*)
+    cpdef void insert(self, ssize_t index, DigitalSequence sequence) except *
+    cpdef size_t index(self, DigitalSequence sequence, ssize_t start=*, ssize_t stop=*) except *
+    cpdef void remove(self, DigitalSequence sequence) except *
+
+    cpdef DigitalSequenceBlock copy(self)
+    cpdef TextSequenceBlock textize(self)
+    cpdef DigitalSequenceBlock translate(self, GeneticCode genetic_code=*)
+    cpdef DigitalSequence largest(self)
 
 # --- Sequence File ----------------------------------------------------------
 
 cdef class SequenceFile:
     cdef          ESL_SQFILE* _sqfp
-    cdef          object      _file
+    cdef readonly object      _file
     cdef readonly Alphabet    alphabet
+    cdef readonly str         name
 
     @staticmethod
     cdef ESL_SQFILE* _open_fileobj(object fh, int fmt) except NULL
-    cdef Alphabet guess_alphabet(self)
 
-    cpdef void close(self)
+    cpdef void close(self) except *
+    cpdef Alphabet guess_alphabet(self)
     cpdef Sequence read(self, bint skip_info=*, bint skip_sequence=*)
     cpdef Sequence readinto(self, Sequence, bint skip_info=*, bint skip_sequence=*)
-
+    cpdef SequenceBlock read_block(self, object sequences=*, object residues=*)
+    cpdef void rewind(self) except *
 
 # --- Sequence/Subsequence Index ---------------------------------------------
 

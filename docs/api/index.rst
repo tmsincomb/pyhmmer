@@ -25,6 +25,7 @@ API Reference
         :nosignatures:
 
         pyhmmer.hmmer.hmmsearch
+        pyhmmer.hmmer.hmmscan
         pyhmmer.hmmer.phmmer
         pyhmmer.hmmer.nhmmer
         pyhmmer.hmmer.hmmpress
@@ -43,6 +44,7 @@ API Reference
        pyhmmer.easel.Bitfield
        pyhmmer.easel.KeyHash
 
+
     Sequences
     ^^^^^^^^^
 
@@ -52,6 +54,25 @@ API Reference
        pyhmmer.easel.Sequence
        pyhmmer.easel.TextSequence
        pyhmmer.easel.DigitalSequence
+
+
+    Sequence Blocks
+    ^^^^^^^^^^^^^^^
+
+    .. autosummary::
+       :nosignatures:
+
+       pyhmmer.easel.SequenceBlock
+       pyhmmer.easel.TextSequenceBlock
+       pyhmmer.easel.DigitalSequenceBlock
+
+
+    Sequence File
+    ^^^^^^^^^^^^^
+
+    .. autosummary::
+       :nosignatures:
+
        pyhmmer.easel.SequenceFile
 
 
@@ -64,6 +85,14 @@ API Reference
        pyhmmer.easel.MSA
        pyhmmer.easel.TextMSA
        pyhmmer.easel.DigitalMSA
+
+
+    Alignment File
+    ^^^^^^^^^^^^^^
+
+    .. autosummary::
+       :nosignatures:
+
        pyhmmer.easel.MSAFile
 
 
@@ -97,26 +126,26 @@ API Reference
     Plan7
     -----
 
-    Hidden Markov Model
-    ^^^^^^^^^^^^^^^^^^^
+    Profile HMMs
+    ^^^^^^^^^^^^
 
     .. autosummary::
         :nosignatures:
 
         pyhmmer.plan7.HMM
-        pyhmmer.plan7.HMMFile
-        pyhmmer.plan7.HMMPressedFile
+        pyhmmer.plan7.Profile
+        pyhmmer.plan7.OptimizedProfile
+        pyhmmer.plan7.OptimizedProfileBlock
 
 
-    Profile
-    ^^^^^^^
+    HMM Files
+    ^^^^^^^^^
 
     .. autosummary::
         :nosignatures:
 
-        pyhmmer.plan7.Profile
-        pyhmmer.plan7.OptimizedProfile
-        pyhmmer.plan7.Background
+        pyhmmer.plan7.HMMFile
+        pyhmmer.plan7.HMMPressedFile
 
 
     Pipelines
@@ -128,6 +157,7 @@ API Reference
         pyhmmer.plan7.Pipeline
         pyhmmer.plan7.LongTargetsPipeline
         pyhmmer.plan7.Builder
+        pyhmmer.plan7.Background
 
 
     Results
@@ -173,7 +203,6 @@ API Reference
         pyhmmer.plan7.Cutoffs
         pyhmmer.plan7.EvalueParameters
         pyhmmer.plan7.Offsets
-        pyhmmer.plan7.PipelineSearchTargets
 
 
     Daemon
@@ -195,3 +224,4 @@ API Reference
        pyhmmer.errors.AllocationError
        pyhmmer.errors.UnexpectedError
        pyhmmer.errors.EaselError
+       pyhmmer.errors.AlphabetMismatch

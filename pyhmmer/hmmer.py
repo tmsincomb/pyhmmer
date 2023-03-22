@@ -1,61 +1,144 @@
 # coding: utf-8
-"""Reimplementation of HMMER binaries with the pyHMMER API.
+"""Reimplementation of HMMER binaries with the PyHMMER API.
+
+Note:
+    Functions of this module handle parallelization using threads to run
+    searches in parallel for the different queries. If less queries are
+    given, the number of threads will be reduced to avoid spawning idle
+    threads.
+
 """
 
 import abc
 import contextlib
 import collections
+import copy
 import ctypes
 import itertools
 import io
-import queue
-import time
-import threading
-import typing
-import os
 import multiprocessing
+import os
+import operator
+import queue
+import threading
+import time
+import typing
 
 import psutil
 
-from .easel import Alphabet, DigitalSequence, DigitalMSA, MSA, MSAFile, TextSequence, SequenceFile, SSIWriter
-from .plan7 import Builder, Background, Pipeline, PipelineSearchTargets, LongTargetsPipeline, TopHits, HMM, HMMFile, Profile, TraceAligner, OptimizedProfile
-from .utils import peekable
+from .easel import (
+    Alphabet,
+    DigitalSequence,
+    DigitalMSA,
+    MSA,
+    MSAFile,
+    TextSequence,
+    SequenceFile,
+    SSIWriter,
+    DigitalSequenceBlock,
+)
+from .plan7 import (
+    Builder,
+    Background,
+    Pipeline,
+    LongTargetsPipeline,
+    TopHits,
+    HMM,
+    HMMFile,
+    HMMPressedFile,
+    Profile,
+    TraceAligner,
+    OptimizedProfile,
+    OptimizedProfileBlock,
+)
+from .utils import peekable, singledispatchmethod
 
 # the query type for the pipeline
-_Q = typing.TypeVar("_Q", HMM, Profile, OptimizedProfile, DigitalSequence, DigitalMSA)
-# the model type for the pipeline
-_M = typing.TypeVar("_M", HMM, Profile, OptimizedProfile)
-# the sequence type for the pipeline
-_S = typing.TypeVar("_S", DigitalSequence, DigitalMSA)
+_Q = typing.TypeVar("_Q")
+# the target type for the pipeline
+_T = typing.TypeVar("_T")
+
+# the query types for the different tasks
+_PHMMERQueryType = typing.Union[DigitalSequence, DigitalMSA]
+_SEARCHQueryType = typing.Union[HMM, Profile, OptimizedProfile]
+_NHMMERQueryType = typing.Union[_PHMMERQueryType, _SEARCHQueryType]
+
+# --- Result class -----------------------------------------------------------
+
+class _Chore(typing.Generic[_Q]):
+    """A chore for a worker thread.
+
+    Attributes:
+        query (`object`): The query object to be processed by the worker
+            thread. Exact type depends on the pipeline type.
+        event (`threading.Event`): An event flag to set when the query
+            is done being processed.
+        hits (`pyhmmer.plan7.TopHits`): The hits obtained after processing
+            the query.
+        exception (`BaseException`): An exception that occured while
+            processing the query.
+
+    """
+
+    query: _Q
+    event: threading.Event
+    hits: typing.Optional[TopHits]
+    exception: typing.Optional[BaseException]
+
+    __slots__ = ("query", "event", "hits", "exception")
+
+    def __init__(self, query: _Q) -> None:
+        """Create a new chore from the given query."""
+        self.query = query
+        self.event = threading.Event()
+        self.hits = None
+        self.exception = None
+
+    def available(self) -> bool:
+        """Return whether the chore is done and results are available."""
+        return self.event.is_set()
+
+    def wait(self, timeout: typing.Optional[float] = None) -> bool:
+        """Wait for the chore to be done."""
+        return self.event.wait(timeout)
+
+    def get(self) -> TopHits:
+        """Get the results of the chore, blocking if the chore was not done."""
+        self.event.wait()
+        if self.exception is not None:
+            raise self.exception
+        return typing.cast(TopHits, self.hits)
+
+    def complete(self, hits: TopHits) -> None:
+        """Mark the chore as done and record ``hits`` as the results."""
+        self.hits = hits
+        self.event.set()
+
+    def fail(self, exception: BaseException) -> None:
+        """Mark the chore as done and record ``exception`` as the error."""
+        self.exception = exception
+        self.event.set()
+
 
 # --- Pipeline threads -------------------------------------------------------
 
-class _PipelineThread(typing.Generic[_Q], threading.Thread):
+class _BaseWorker(typing.Generic[_Q, _T], threading.Thread):
     """A generic worker thread to parallelize a pipelined search.
 
     Attributes:
-        sequence (`pyhmmer.plan7.PipelineSearchTargets`): The target
-            sequences to search for hits.
-        query_queue (`queue.Queue`): The queue used to pass queries between
-            threads. It contains both the query and its index, so that the
-            results can be returned in the same order.
+        targets (`DigitalSequenceBlock` or `OptimizedProfileBlock`): The
+            target to search for hits, either a digital sequence block while
+            in search mode, or an optimized profile block while in scan mode.
+        query_queue (`queue.Queue`): The queue used to pass queries
+            between threads. It contains the query, its index so that the
+            results can be returned in the same order, and a `_ResultBuffer`
+            where to store the result when the query has been processed.
         query_count (`multiprocessing.Value`): An atomic counter storing
             the total number of queries that have currently been loaded.
             Passed to the ``callback`` so that an UI can show the total
             for a progress bar.
-        hits_queue (`queue.PriorityQueue`): The queue used to pass back
-            the `TopHits` to the main thread. The results are inserted
-            using the index of the query, so that the main thread can
-            pull results in order.
         kill_switch (`threading.Event`): An event flag shared between
             all worker threads, used to notify emergency exit.
-        hits_found (`list` of `threading.Event`): A list of event flags,
-            such that ``hits_found[i]`` is set when results have been
-            obtained for the query of index ``i``. This allows the main
-            thread to keep waiting for the right `TopHits` to yield even
-            if subsequent queries have already been treated, and to make
-            sure the next result returned by ``hits_queue.get`` will also
-            be of index ``i``.
         callback (`callable`, optional): An optional callback to be called
             after each query has been processed. It should accept two
             arguments: the query object that was processed, and the total
@@ -65,6 +148,9 @@ class _PipelineThread(typing.Generic[_Q], threading.Thread):
         pipeline_class (`type`): The pipeline class to use to search for
             hits. Use `~plan7.LongTargetsPipeline` for `nhmmer`, and
             `~plan7.Pipeline` everywhere else.
+        builder (`~pyhmmer.plan7.Builder`, *optional*): The builder to use
+            for translating sequence or alignment queries into `HMM` objects.
+            May be `None` if the queries are expected to be `HMM` only.
 
     """
 
@@ -74,270 +160,243 @@ class _PipelineThread(typing.Generic[_Q], threading.Thread):
 
     def __init__(
         self,
-        sequences: PipelineSearchTargets,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, _Q]]]",
+        targets: _T,
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[_Q]]]",
         query_count: multiprocessing.Value,  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
         kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
         callback: typing.Optional[typing.Callable[[_Q, int], None]],
         options: typing.Dict[str, typing.Any],
         pipeline_class: typing.Type[Pipeline],
         alphabet: Alphabet,
+        builder: typing.Optional[Builder] = None,
     ) -> None:
         super().__init__()
         self.options = options
-        self.sequences = sequences
+        self.targets: _T = targets
         self.pipeline = pipeline_class(alphabet=alphabet, **options)
-        self.query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, _Q]]]" = query_queue
+        self.query_available: threading.Semaphore = query_available
+        self.query_queue: "queue.Queue[typing.Optional[_Chore[_Q]]]" = query_queue
         self.query_count = query_count
-        self.hits_queue = hits_queue
-        self.callback: "typing.Optional[typing.Callable[[_Q, int], None]]" = callback or self._none_callback
+        self.callback: typing.Optional[typing.Callable[[_Q, int], None]] = (
+            callback or self._none_callback
+        )
         self.kill_switch = kill_switch
-        self.hits_found = hits_found
-        self.error: typing.Optional[BaseException] = None
+        self.builder = builder
 
     def run(self) -> None:
         while not self.kill_switch.is_set():
             # attempt to get the next argument, with a timeout
             # so that the thread can periodically check if it has
-            # been killed, even when the query queue is empty
-            try:
-                args = self.query_queue.get(timeout=1)
-            except queue.Empty:
+            # been killed, even when no queries are available
+            if not self.query_available.acquire(timeout=1):
                 continue
+            chore = self.query_queue.get_nowait()
             # check if arguments from the queue are a poison-pill (`None`),
             # in which case the thread will stop running
-            if args is None:
-                self.query_queue.task_done()
-                return
-            else:
-                index, query = args
-            # process the arguments, making sure to capture any exception
-            # raised while processing the query, and then mark the hits
-            # as "found" using a `threading.Event` for each.
+            if chore is None:
+                break
+            # process the query, making sure to capture any exception
+            # and then mark the hits as "found" using a `threading.Event`
             try:
-                self.process(index, query)
-                self.query_queue.task_done()
+                hits = self.process(chore.query)
+                chore.complete(hits)
             except BaseException as exc:
-                self.error = exc
                 self.kill()
-                return
-            finally:
-                self.hits_found[index].set()
+                chore.fail(exc)
+        if isinstance(self.targets, (SequenceFile, HMMPressedFile)):
+            self.targets.close()
 
     def kill(self) -> None:
+        """Set the synchronized kill switch for all threads."""
         self.kill_switch.set()
 
-    def process(self, index: int, query: _Q) -> None:
-        hits = self.search(query)
-        self.hits_queue.put((index, hits))
+    def process(self, query: _Q) -> TopHits:
+        """Process a single query and return the resulting hits."""
+        if isinstance(self.targets, (HMMPressedFile, SequenceFile)):
+            self.targets.rewind()
+        hits = self.query(query)
         self.callback(query, self.query_count.value)  # type: ignore
         self.pipeline.clear()
+        return hits
 
     @abc.abstractmethod
-    def search(self, query: _Q) -> TopHits:
+    def query(self, query: _Q) -> TopHits:
+        """Run a single query against the target database."""
         return NotImplemented
 
 
-class _ModelPipelineThread(typing.Generic[_M], _PipelineThread[_M]):
-    def search(self, query: _M) -> TopHits:
-        return self.pipeline.search_hmm(query, self.sequences)
+class _SEARCHWorker(_BaseWorker[_SEARCHQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
+    @singledispatchmethod
+    def query(self, query) -> TopHits:  # type: ignore
+        raise TypeError("Unsupported query type for `hmmsearch`: {}".format(type(query).__name__))
+
+    @query.register(HMM)
+    @query.register(Profile)
+    @query.register(OptimizedProfile)
+    def _(self, query: typing.Union[HMM, Profile, OptimizedProfile]) -> TopHits:  # type: ignore
+        return self.pipeline.search_hmm(query, self.targets)
 
 
-class _SequencePipelineThread(_PipelineThread[DigitalSequence]):
-    def __init__(
-        self,
-        sequences: PipelineSearchTargets,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, DigitalSequence]]]",
-        query_count: multiprocessing.Value,  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
-        kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-        callback: typing.Optional[typing.Callable[[DigitalSequence, int], None]],
-        options: typing.Dict[str, typing.Any],
-        pipeline_class: typing.Type[Pipeline],
-        alphabet: Alphabet,
-        builder: Builder,
-    ) -> None:
-        super().__init__(
-            sequences,
-            query_queue,
-            query_count,
-            hits_queue,
-            kill_switch,
-            hits_found,
-            callback,
-            options,
-            pipeline_class,
-            alphabet,
-        )
-        self.builder = builder
+class _PHMMERWorker(_BaseWorker[_PHMMERQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
+    @singledispatchmethod
+    def query(self, query) -> TopHits:  # type: ignore
+        raise TypeError("Unsupported query type for `phmmer`: {}".format(type(query).__name__))
 
-    def search(self, query: DigitalSequence) -> TopHits:
-        return self.pipeline.search_seq(query, self.sequences, self.builder)
+    @query.register(DigitalSequence)
+    def _(self, query: DigitalSequence) -> TopHits:  # type: ignore
+        return self.pipeline.search_seq(query, self.targets, self.builder)
+
+    @query.register(DigitalMSA)
+    def _(self, query: DigitalMSA) -> TopHits:  # type: ignore
+        return self.pipeline.search_msa(query, self.targets, self.builder)
 
 
-class _MSAPipelineThread(_PipelineThread[DigitalMSA]):
-    def __init__(
-        self,
-        sequences: PipelineSearchTargets,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, DigitalMSA]]]",
-        query_count: multiprocessing.Value,  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
-        kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-        callback: typing.Optional[typing.Callable[[DigitalMSA, int], None]],
-        options: typing.Dict[str, typing.Any],
-        pipeline_class: typing.Type[Pipeline],
-        alphabet: Alphabet,
-        builder: Builder,
-    ) -> None:
-        super().__init__(
-            sequences,
-            query_queue,
-            query_count,
-            hits_queue,
-            kill_switch,
-            hits_found,
-            callback,
-            options,
-            pipeline_class,
-            alphabet,
-        )
-        self.builder = builder
+class _NHMMERWorker(_BaseWorker[_NHMMERQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
+    @singledispatchmethod
+    def query(self, query) -> TopHits:  # type: ignore
+        raise TypeError("Unsupported query type for `nhmmer`: {}".format(type(query).__name__))
 
-    def search(self, query: DigitalMSA) -> TopHits:
-        return self.pipeline.search_msa(query, self.sequences, self.builder)
+    @query.register(DigitalSequence)
+    def _(self, query: DigitalSequence) -> TopHits:  # type: ignore
+        return self.pipeline.search_seq(query, self.targets, self.builder)
+
+    @query.register(DigitalMSA)
+    def _(self, query: DigitalMSA) -> TopHits:  # type: ignore
+        return self.pipeline.search_msa(query, self.targets, self.builder)
+
+    @query.register(HMM)
+    @query.register(Profile)
+    @query.register(OptimizedProfile)
+    def _(self, query: typing.Union[HMM, Profile, OptimizedProfile]) -> TopHits:  # type: ignore
+        return self.pipeline.search_hmm(query, self.targets)
+
+
+class _SCANWorker(_BaseWorker[DigitalSequence, typing.Union[OptimizedProfileBlock, HMMPressedFile]]):
+    @singledispatchmethod
+    def query(self, query) -> TopHits:  # type: ignore
+        raise TypeError("Unsupported query type for `hmmscan`: {}".format(type(query).__name__))
+
+    @query.register(DigitalSequence)
+    def _(self, query: DigitalSequence) -> TopHits:  # type: ignore
+        return self.pipeline.scan_seq(query, self.targets)
 
 
 # --- Search runners ---------------------------------------------------------
 
-class _Search(typing.Generic[_Q], abc.ABC):
-
+class _BaseDispatcher(typing.Generic[_Q, _T], abc.ABC):
     def __init__(
         self,
         queries: typing.Iterable[_Q],
-        sequences: typing.Iterable[DigitalSequence],
+        targets: _T,
         cpus: int = 0,
         callback: typing.Optional[typing.Callable[[_Q, int], None]] = None,
         pipeline_class: typing.Type[Pipeline] = Pipeline,
         alphabet: Alphabet = Alphabet.amino(),
-        **options # type: typing.Dict[str, object]
+        builder: typing.Optional[Builder] = None,
+        **options,  # type: object
     ) -> None:
-        self.queries: typing.Iterable[_Q] = queries
-        self.cpus = cpus
+        self.queries = queries
+        self.targets: _T = targets
         self.callback: typing.Optional[typing.Callable[[_Q, int], None]] = callback
         self.options = options
         self.pipeline_class = pipeline_class
         self.alphabet = alphabet
-        if isinstance(sequences, PipelineSearchTargets):
-            self.sequences = sequences
-        else:
-            self.sequences = PipelineSearchTargets(sequences)
+        self.builder = builder
+
+        # make sure a positive number of CPUs is requested
+        if cpus <= 0:
+            raise ValueError("`cpus` must be strictly positive, not {!r}".format(cpus))
+
+        # reduce the number of threads if there are less queries (at best
+        # use one thread by query)
+        hint = operator.length_hint(queries, -1)
+        self.cpus = 1 if hint == 0 else min(cpus, hint) if hint > 0 else cpus
 
     @abc.abstractmethod
     def _new_thread(
         self,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, _Q]]]",
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[_Q]]]",
         query_count: "multiprocessing.Value[int]",  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
         kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-    ) -> _PipelineThread[_Q]:
+    ) -> _BaseWorker[_Q, _T]:
         return NotImplemented
 
     def _single_threaded(self) -> typing.Iterator[TopHits]:
         # create the queues to pass the HMM objects around, as well as atomic
         # values that we use to synchronize the threads
-        hits_found: typing.List[threading.Event] = []
+        query_available = threading.Semaphore(0)
         query_queue = queue.Queue()  # type: ignore
         query_count = multiprocessing.Value(ctypes.c_ulong)
-        hits_queue = queue.PriorityQueue()  # type: ignore
         kill_switch = threading.Event()
 
         # create the thread (to recycle code)
-        thread = self._new_thread(query_queue, query_count, hits_queue, kill_switch, hits_found)
+        thread = self._new_thread(
+            query_available, query_queue, query_count, kill_switch
+        )
 
         # process each HMM iteratively and yield the result
         # immediately so that the user can iterate over the
         # TopHits one at a time
-        for index, query in enumerate(self.queries):
+        for query in self.queries:
             query_count.value += 1
-            thread.process(index, query)
-            yield hits_queue.get_nowait()[1]
+            yield thread.process(query)
+
+        # close the targets if they were coming from a file
+        if isinstance(thread.targets, (SequenceFile, HMMPressedFile)):
+            thread.targets.close()
 
     def _multi_threaded(self) -> typing.Iterator[TopHits]:
-        # create the queues to pass the HMM objects around, as well as atomic
-        # values that we use to synchronize the threads
-        hits_found: typing.List[threading.Event] = []
-        hits_queue = queue.PriorityQueue()  # type: ignore
+        # create the semaphore which will be used to notify worker threads
+        # there is a new chore available
+        query_available = threading.Semaphore(0)
+        # create the queues to pass the query objects around, as well as
+        # atomic values that we use to synchronize the threads
+        results: typing.Deque[_Chore[_Q]] = collections.deque()
+        query_queue = queue.Queue(maxsize=self.cpus)  # type: ignore
         query_count = multiprocessing.Value(ctypes.c_ulong)
         kill_switch = threading.Event()
-        # the query queue is bounded so that we only feed more queries
-        # if the worker threads are waiting for some
-        query_queue = queue.Queue(maxsize=self.cpus)  # type: ignore
-        # additional type annotations
-        query: typing.Optional[_Q]
-        index: int
 
         # create and launch one pipeline thread per CPU
         threads = []
         for _ in range(self.cpus):
-            thread = self._new_thread(query_queue, query_count, hits_queue, kill_switch, hits_found)
+            thread = self._new_thread(
+                query_available, query_queue, query_count, kill_switch
+            )
             thread.start()
             threads.append(thread)
 
         # catch exceptions to kill threads in the background before exiting
         try:
-            # enumerate queries, so that we now the index of each query
-            # and we can yield the results in the same order
-            queries = enumerate(self.queries)
-            # initially feed one query per thread so that they can start
-            # working before we enter the main loop
-            for (index, query) in itertools.islice(queries, self.cpus):
-                query_count.value += 1
-                hits_found.append(threading.Event())
-                query_queue.put((index, query))
             # alternate between feeding queries to the threads and
-            # yielding back results, if available
-            hits_yielded = 0
-            while hits_yielded < query_count.value:
-                # get the next query, or break the loop if there is no query
-                # left to process in the input iterator.
-                index, query = next(queries, (-1, None))
-                if query is None:
-                    break
-                else:
-                    query_count.value += 1
-                    hits_found.append(threading.Event())
-                    query_queue.put((index, query))
-                # yield the top hits for the next query, if available
-                if hits_found[hits_yielded].is_set():
-                    yield hits_queue.get_nowait()[1]
-                    hits_yielded += 1
+            # yielding back results, if available. the priority is
+            # given to filling the query queue, so that no worker
+            # ever idles.
+            for query in self.queries:
+                # get the next query and add it to the query queue
+                query_count.value += 1
+                chore = _Chore(query)
+                query_queue.put(chore)  # <-- blocks if too many chores in queue
+                query_available.release()
+                results.append(chore)
+                # aggressively wait for the result with a very short
+                # timeout, and exit the loop if the queue is not full
+                if results[0].available():
+                    yield results[0].get()
+                    results.popleft()
             # now that we exhausted all queries, poison pill the
-            # threads so they stop on their own
+            # threads so they stop on their own gracefully
             for _ in threads:
                 query_queue.put(None)
-            # yield remaining results
-            while hits_yielded < query_count.value:
-                hits_found[hits_yielded].wait()
-                yield hits_queue.get_nowait()[1]
-                hits_yielded += 1
-        except queue.Empty:
-            # the only way we can get queue.Empty is if a thread has set
-            # the flag for `hits_found[i]` without actually putting it in
-            # the queue: this only happens when a background thread raised
-            # an exception, so we must chain it
-            for thread in threads:
-                if thread.error is not None:
-                    raise thread.error from None
-            # if this is exception is otherwise a bug, make sure to reraise it
-            raise
+                query_available.release()
+            # yield all remaining results, in order
+            while results:
+                yield results[0].get()  # <-- blocks until result is available
+                results.popleft()
         except BaseException:
             # make sure threads are killed to avoid being stuck,
-            # e.g. after a KeyboardInterrupt
+            # e.g. after a KeyboardInterrupt, then re-raise
             kill_switch.set()
             raise
 
@@ -348,23 +407,30 @@ class _Search(typing.Generic[_Q], abc.ABC):
             return self._multi_threaded()
 
 
-class _ModelSearch(typing.Generic[_M], _Search[_M]):
-
+class _SEARCHDispatcher(_BaseDispatcher[_SEARCHQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
     def _new_thread(
         self,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, _M]]]",
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[_SEARCHQueryType]]]",
         query_count: "multiprocessing.Value[int]",  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
         kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-    ) -> _ModelPipelineThread[_M]:
-        return _ModelPipelineThread(
-            self.sequences,
+    ) -> _SEARCHWorker:
+        if isinstance(self.targets, SequenceFile):
+            assert self.targets.name is not None
+            targets = SequenceFile(
+                self.targets.name,
+                format=self.targets.format,
+                digital=True,
+                alphabet=self.alphabet
+            )
+        else:
+            targets = self.targets  # type: ignore
+        return _SEARCHWorker(
+            targets,
+            query_available,
             query_queue,
             query_count,
-            hits_queue,
             kill_switch,
-            hits_found,
             self.callback,
             self.options,
             self.pipeline_class,
@@ -372,100 +438,157 @@ class _ModelSearch(typing.Generic[_M], _Search[_M]):
         )
 
 
-class _SequenceSearch(_Search[DigitalSequence]):
-
-    def __init__(
-        self,
-        builder: Builder,
-        queries: typing.Iterable[DigitalSequence],
-        sequences: typing.Iterable[DigitalSequence],
-        cpus: int = 0,
-        callback: typing.Optional[typing.Callable[[DigitalSequence, int], None]] = None,
-        pipeline_class: typing.Type[Pipeline] = Pipeline,
-        alphabet: Alphabet = Alphabet.amino(),
-        **options, # type: typing.Dict[str, object]
-    ) -> None:
-        super().__init__(queries, sequences, cpus, callback, pipeline_class, alphabet, **options)
-        self.builder = builder
-
+class _PHMMERDispatcher(_BaseDispatcher[_PHMMERQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
     def _new_thread(
         self,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, DigitalSequence]]]",
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[_PHMMERQueryType]]]",
         query_count: "multiprocessing.Value[int]",  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
         kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-    ) -> _SequencePipelineThread:
-        return _SequencePipelineThread(
-            self.sequences,
+    ) -> _PHMMERWorker:
+        if isinstance(self.targets, SequenceFile):
+            assert self.targets.name is not None
+            targets = SequenceFile(
+                self.targets.name,
+                format=self.targets.format,
+                digital=True,
+                alphabet=self.alphabet
+            )
+        else:
+            targets = self.targets  # type: ignore
+        return _PHMMERWorker(
+            targets,
+            query_available,
             query_queue,
             query_count,
-            hits_queue,
             kill_switch,
-            hits_found,
             self.callback,
             self.options,
             self.pipeline_class,
             self.alphabet,
-            self.builder.copy(),
+            copy.copy(self.builder),
         )
 
 
-class _MSASearch(_Search[DigitalMSA]):
-
+class _NHMMERDispatcher(_BaseDispatcher[_NHMMERQueryType, typing.Union[DigitalSequenceBlock, SequenceFile]]):
     def __init__(
         self,
-        builder: Builder,
-        queries: typing.Iterable[DigitalMSA],
-        sequences: typing.Iterable[DigitalSequence],
+        queries: typing.Iterable[_NHMMERQueryType],
+        targets: typing.Union[DigitalSequenceBlock, SequenceFile],
         cpus: int = 0,
-        callback: typing.Optional[typing.Callable[[DigitalMSA, int], None]] = None,
-        pipeline_class: typing.Type[Pipeline] = Pipeline,
-        alphabet: Alphabet = Alphabet.amino(),
-        **options, # type: typing.Dict[str, object]
+        callback: typing.Optional[
+            typing.Callable[[_NHMMERQueryType, int], None]
+        ] = None,
+        pipeline_class: typing.Type[Pipeline] = LongTargetsPipeline,
+        alphabet: Alphabet = Alphabet.dna(),
+        builder: Builder = None,
+        **options,  # type: typing.Dict[str, object]
     ) -> None:
-        super().__init__(queries, sequences, cpus, callback, pipeline_class, alphabet, **options)
-        self.builder = builder
+        super().__init__(
+            queries,
+            targets,
+            cpus,
+            callback,
+            pipeline_class,
+            alphabet,
+            builder,
+            **options,
+        )
 
     def _new_thread(
         self,
-        query_queue: "queue.Queue[typing.Optional[typing.Tuple[int, DigitalMSA]]]",
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[_NHMMERQueryType]]]",
         query_count: "multiprocessing.Value[int]",  # type: ignore
-        hits_queue: "queue.PriorityQueue[typing.Tuple[int, TopHits]]",
         kill_switch: threading.Event,
-        hits_found: typing.List[threading.Event],
-    ) -> _MSAPipelineThread:
-        return _MSAPipelineThread(
-            self.sequences,
+    ) -> _NHMMERWorker:
+        if isinstance(self.targets, SequenceFile):
+            assert self.targets.name is not None
+            targets = SequenceFile(
+                self.targets.name,
+                format=self.targets.format,
+                digital=True,
+                alphabet=self.alphabet
+            )
+        else:
+            targets = self.targets  # type: ignore
+        return _NHMMERWorker(
+            targets,
+            query_available,
             query_queue,
             query_count,
-            hits_queue,
             kill_switch,
-            hits_found,
             self.callback,
             self.options,
             self.pipeline_class,
             self.alphabet,
-            self.builder.copy(),
+            copy.copy(self.builder),
+        )
+
+
+class _SCANDispatcher(_BaseDispatcher[DigitalSequence, typing.Union[OptimizedProfileBlock, HMMPressedFile]]):
+    def _new_thread(
+        self,
+        query_available: threading.Semaphore,
+        query_queue: "queue.Queue[typing.Optional[_Chore[DigitalSequence]]]",
+        query_count: "multiprocessing.Value[int]",  # type: ignore
+        kill_switch: threading.Event,
+    ) -> _SCANWorker:
+        if isinstance(self.targets, HMMPressedFile):
+            assert self.targets.name is not None
+            targets = HMMPressedFile(self.targets.name)
+        else:
+            targets = self.targets  # type: ignore
+        return _SCANWorker(
+            targets,
+            query_available,
+            query_queue,
+            query_count,
+            kill_switch,
+            self.callback,
+            self.options,
+            self.pipeline_class,
+            self.alphabet,
         )
 
 
 # --- hmmsearch --------------------------------------------------------------
 
 def hmmsearch(
-    queries: typing.Iterable[_M],
+    queries: typing.Union[_SEARCHQueryType, typing.Iterable[_SEARCHQueryType]],
     sequences: typing.Iterable[DigitalSequence],
+    *,
     cpus: int = 0,
-    callback: typing.Optional[typing.Callable[[_M, int], None]] = None,
+    callback: typing.Optional[typing.Callable[[_SEARCHQueryType, int], None]] = None,
     **options,  # type: typing.Dict[str, object]
 ) -> typing.Iterator[TopHits]:
     """Search HMM profiles against a sequence database.
 
+    In HMMER many-to-many comparisons, a *search* is the operation of
+    querying with profile HMMs a database of sequences.
+
+    The `hmmsearch` function offers two ways of managing the database that
+    will be selected based on the type of the ``sequences`` argument. If
+    ``sequences`` is an `SequenceFile` object, `hmmsearch` will reopen the
+    file in each thread, and load targets *iteratively* to scan with the
+    query. Otherwise, it will *pre-fetch* the target sequences into a
+    `DigitalSequenceBlock` collection, and share them across threads
+    without copy. The *pre-fetching* gives much higher performance at the
+    cost of extra  startup time and much higher memory consumption. You may
+    want to check how much memory is available (for instance with
+    `psutil.virtual_memory`) before trying to load a whole sequence database,
+    but it is really recommended to do so whenever possible.
+
     Arguments:
         queries (iterable of `HMM`, `Profile` or `OptimizedProfile`): The
-            query HMMs or profiles to search for in the database.
-        sequences (collection of `~pyhmmer.easel.DigitalSequence`): A
-            database of sequences to query.
+            query HMMs or profiles to search for in the database. Note that
+            passing a single object is supported.
+        sequences (iterable of `~pyhmmer.easel.DigitalSequence`): A
+            database of sequences to query. If you plan on using the
+            same sequences several times, consider storing them into
+            a `~pyhmmer.easel.DigitalSequenceBlock` directly. If a
+            `SequenceFile` is given, profiles will be loaded iteratively
+            from disk rather than prefetched.
         cpus (`int`): The number of threads to run in parallel. Pass ``1``
             to run everything in the main thread, ``0`` to automatically
             select a suitable number (using `psutil.cpu_count`), or any
@@ -480,41 +603,89 @@ def hmmsearch(
 
     Raises:
         `~pyhmmer.errors.AlphabetMismatch`: When any of the query HMMs
-        and the sequences do not share the same alphabet.
+            and the sequences do not share the same alphabet.
 
     Note:
         Any additional arguments passed to the `hmmsearch` function will be
         passed transparently to the `~pyhmmer.plan7.Pipeline` to be created.
+        For instance, to run a ``hmmsearch`` using a bitscore cutoffs of
+        5 instead of the default E-value cutoff, use::
+
+            >>> hits = next(hmmsearch(thioesterase, proteins, T=5))
+            >>> hits[0].score
+            8.601...
 
     .. versionadded:: 0.1.0
 
     .. versionchanged:: 0.4.9
        Allow using `Profile` and `OptimizedProfile` queries.
 
+    .. versionchanged:: 0.7.0
+        Queries may now be an iterable of different types, or a single object.
+
     """
-    # count the number of CPUs to use
-    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or multiprocessing.cpu_count()
-    runner: _ModelSearch[_M] = _ModelSearch(queries, sequences, _cpus, callback, **options) # type: ignore
-    return runner.run()
+    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or os.cpu_count() or 1
+
+    if not isinstance(queries, collections.abc.Iterable):
+        queries = (queries,)
+
+    if isinstance(sequences, SequenceFile):
+        sequence_file: SequenceFile = sequences
+        if sequence_file.name is None:
+            raise ValueError("expected named `SequenceFile` for targets")
+        if not sequence_file.digital:
+            raise ValueError("expected digital mode `SequenceFile` for targets")
+        assert sequence_file.alphabet is not None
+        alphabet = sequence_file.alphabet
+        targets: typing.Union[SequenceFile, DigitalSequenceBlock] = sequence_file
+    elif isinstance(sequences, DigitalSequenceBlock):
+        alphabet = sequences.alphabet
+        targets = sequences
+    else:
+        queries = peekable(queries)
+        try:
+            alphabet = queries.peek().alphabet
+            targets = DigitalSequenceBlock(alphabet, sequences)
+        except StopIteration:
+            alphabet = Alphabet.amino()
+            targets = DigitalSequenceBlock(alphabet)
+
+    dispatcher = _SEARCHDispatcher(
+        queries=queries,
+        targets=targets,
+        cpus=_cpus,
+        callback=callback,
+        alphabet=alphabet,
+        builder=None,
+        pipeline_class=Pipeline,
+        **options,
+    )
+    return dispatcher.run()
 
 
 # --- phmmer -----------------------------------------------------------------
 
 def phmmer(
-    queries: typing.Iterable[_S],
+    queries: typing.Union[_PHMMERQueryType, typing.Iterable[_PHMMERQueryType]],
     sequences: typing.Iterable[DigitalSequence],
+    *,
     cpus: int = 0,
-    callback: typing.Optional[typing.Callable[[_S, int], None]] = None,
+    callback: typing.Optional[typing.Callable[[_PHMMERQueryType, int], None]] = None,
     builder: typing.Optional[Builder] = None,
-    **options, # type: typing.Dict[str, object]
+    **options,  # type: typing.Dict[str, object]
 ) -> typing.Iterator[TopHits]:
     """Search protein sequences against a sequence database.
 
     Arguments:
-        queries (iterable of `DigitalSequence` or `DigitalMSA`): The
-            query sequences to search for in the sequence database.
-        sequences (collection of `~pyhmmer.easel.DigitalSequence`): A
-            database of sequences to query.
+        queries (iterable of `DigitalSequence` or `DigitalMSA`): The query
+            sequences to search for in the sequence database. Passing a
+            single object is supported.
+        sequences (iterable of `~pyhmmer.easel.DigitalSequence`): A database
+            of sequences to query. If you plan on using the same sequences
+            several times, consider storing them into a
+            `~pyhmmer.easel.DigitalSequenceBlock` directly. If a
+            `SequenceFile` is given, profiles will be loaded iteratively
+            from disk rather than prefetched.
         cpus (`int`): The number of threads to run in parallel. Pass ``1`` to
             run everything in the main thread, ``0`` to automatically
             select a suitable number (using `psutil.cpu_count`), or any
@@ -530,6 +701,11 @@ def phmmer(
         `~pyhmmer.plan7.TopHits`: A *top hits* instance for each query,
         in the same order the queries were passed in the input.
 
+    Raises:
+        `~pyhmmer.errors.AlphabetMismatch`: When any of the query sequence
+            the profile or the optional builder do not share the same
+            alphabet.
+
     Note:
         Any additional keyword arguments passed to the `phmmer` function
         will be passed transparently to the `~pyhmmer.plan7.Pipeline` to
@@ -540,57 +716,69 @@ def phmmer(
     .. versionchanged:: 0.3.0
        Allow using `DigitalMSA` queries.
 
+    .. versionchanged:: 0.7.0
+        Queries may now be an iterable of different types, or a single object.
+
     """
-    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or multiprocessing.cpu_count()
-    _builder = Builder(Alphabet.amino()) if builder is None else builder
+    _alphabet = Alphabet.amino()
+    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or os.cpu_count() or 1
+    _builder = Builder(_alphabet) if builder is None else builder
 
-    try:
-        _queries: peekable[typing.Union[DigitalSequence, DigitalMSA, HMM]] = peekable(queries)
-        _item: typing.Union[DigitalSequence, DigitalMSA, HMM, None] = _queries.peek()
-    except StopIteration:
-        _item = None
+    if not isinstance(queries, collections.abc.Iterable):
+        queries = (queries,)
 
-    runner: typing.Union[_SequenceSearch, _MSASearch]
-    if _item is None or isinstance(_item, DigitalSequence):
-        runner = _SequenceSearch(
-            _builder,
-            typing.cast(peekable[DigitalSequence], _queries),
-            sequences,
-            _cpus,
-            callback,  # type: ignore
-            pipeline_class=Pipeline,
-            alphabet=Alphabet.amino(),
-            **options
-        )
-    elif isinstance(_item, DigitalMSA):
-        runner = _MSASearch(
-            _builder, _queries, sequences, _cpus, callback, pipeline_class=Pipeline, alphabet=Alphabet.amino(), **options   # type: ignore
-        )
+    if isinstance(sequences, SequenceFile):
+        sequence_file: SequenceFile = sequences
+        if sequence_file.name is None:
+            raise ValueError("expected named `SequenceFile` for targets")
+        if not sequence_file.digital:
+            raise ValueError("expected digital mode `SequenceFile` for targets")
+        assert sequence_file.alphabet is not None
+        alphabet = sequence_file.alphabet
+        targets: typing.Union[SequenceFile, DigitalSequenceBlock] = sequence_file
+    elif isinstance(sequences, DigitalSequenceBlock):
+        alphabet = sequences.alphabet
+        targets = sequences
     else:
-        name = type(_item).__name__
-        raise TypeError(f"Expected iterable of DigitalSequence or DigitalMSA, found {name}")
+        alphabet = _alphabet
+        targets = DigitalSequenceBlock(_alphabet, sequences)
 
-    return runner.run()
+    dispatcher = _PHMMERDispatcher(
+        queries=queries,
+        targets=targets,
+        cpus=_cpus,
+        callback=callback,
+        pipeline_class=Pipeline,
+        alphabet=alphabet,
+        builder=_builder,
+        **options,
+    )
+    return dispatcher.run()
 
 
 # --- nhmmer -----------------------------------------------------------------
 
 def nhmmer(
-    queries: typing.Iterable[_Q],
+    queries: typing.Union[_NHMMERQueryType, typing.Iterable[_NHMMERQueryType]],
     sequences: typing.Iterable[DigitalSequence],
+    *,
     cpus: int = 0,
-    callback: typing.Optional[typing.Callable[[_Q, int], None]] = None,
+    callback: typing.Optional[typing.Callable[[_NHMMERQueryType, int], None]] = None,
     builder: typing.Optional[Builder] = None,
-    **options, # type: typing.Dict[str, object]
+    **options,  # type: typing.Dict[str, object]
 ) -> typing.Iterator[TopHits]:
     """Search nucleotide sequences against a sequence database.
 
     Arguments:
         queries (iterable of `DigitalSequence`, `DigitalMSA`, `HMM`): The
             query sequences or profiles to search for in the sequence
-            database.
-        sequences (collection of `~pyhmmer.easel.DigitalSequence`): A
-            database of sequences to query.
+            database. Passing a single object is supported.
+        sequences (iterable of `~pyhmmer.easel.DigitalSequence`): A
+            database of sequences to query. If you plan on using the
+            same sequences several times, consider storing them into
+            a `~pyhmmer.easel.DigitalSequenceBlock` directly. If a
+            `SequenceFile` is given, profiles will be loaded iteratively
+            from disk rather than prefetched.
         cpus (`int`): The number of threads to run in parallel. Pass ``1`` to
             run everything in the main thread, ``0`` to automatically
             select a suitable number (using `psutil.cpu_count`), or any
@@ -612,7 +800,7 @@ def nhmmer(
         in each worker thread. The ``strand`` argument can be used to
         restrict the search on the direct or reverse strand.
 
-    Hint:
+    Caution:
         This function is not just `phmmer` for nucleotide sequences; it
         actually uses a `~pyhmmer.plan7.LongTargetsPipeline` internally
         instead of processing each target sequence in its entirety when
@@ -625,59 +813,51 @@ def nhmmer(
     .. versionchanged:: 0.4.9
        Allow using `Profile` and `OptimizedProfile` queries.
 
+    .. versionchanged:: 0.7.0
+        Queries may now be an iterable of different types, or a single object.
+
     """
-    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or multiprocessing.cpu_count()
-    _builder = Builder(Alphabet.dna()) if builder is None else builder
+    _alphabet = Alphabet.dna()
+    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or os.cpu_count() or 1
+    _builder = Builder(_alphabet) if builder is None else builder
 
-    try:
-        _queries: peekable[_Q] = peekable(queries)
-        _item: typing.Optional[_Q] = _queries.peek()
-    except StopIteration:
-        _item = None
+    if not isinstance(queries, collections.abc.Iterable):
+        queries = (queries,)
 
-    runner: typing.Union[_SequenceSearch, _MSASearch, _ModelSearch[HMM]]
-    if _item is None or isinstance(_item, DigitalSequence):
-        runner = _SequenceSearch(
-            _builder,
-            typing.cast(peekable[DigitalSequence], _queries),
-            sequences,
-            _cpus,
-            callback,  # type: ignore
-            pipeline_class=LongTargetsPipeline,
-            alphabet=_item.alphabet if _item is not None else Alphabet.dna(),  # type: ignore
-            **options,
-        )
-    elif isinstance(_item, DigitalMSA):
-        runner = _MSASearch(
-            _builder,
-            typing.cast(peekable[DigitalMSA], _queries),
-            sequences,
-            _cpus,
-            callback,
-            pipeline_class=LongTargetsPipeline,
-            alphabet=_item.alphabet,
-            **options,
-        )
-    elif isinstance(_item, (HMM, Profile, OptimizedProfile)):
-        runner = _ModelSearch(
-            typing.cast(peekable[HMM], _queries),
-            sequences,
-            _cpus,
-            callback,  # type: ignore
-            pipeline_class=LongTargetsPipeline,
-            alphabet=_item.alphabet,
-            **options,
-        )
+    if isinstance(sequences, SequenceFile):
+        sequence_file: SequenceFile = sequences
+        if sequence_file.name is None:
+            raise ValueError("expected named `SequenceFile` for targets")
+        if not sequence_file.digital:
+            raise ValueError("expected digital mode `SequenceFile` for targets")
+        assert sequence_file.alphabet is not None
+        alphabet = sequence_file.alphabet
+        targets: typing.Union[SequenceFile, DigitalSequenceBlock] = sequence_file
+    elif isinstance(sequences, DigitalSequenceBlock):
+        alphabet = sequences.alphabet
+        targets = sequences
     else:
-        name = type(_item).__name__
-        raise TypeError(f"Expected iterable of DigitalSequence, DigitalMSA, HMM, Profile or OptimizedProfile, found {name}")
-    return runner.run()
+        alphabet = _alphabet
+        targets = DigitalSequenceBlock(_alphabet, sequences)
+
+    dispatcher = _NHMMERDispatcher(
+        queries=queries,
+        targets=targets,
+        cpus=_cpus,
+        callback=callback,
+        pipeline_class=LongTargetsPipeline,
+        alphabet=alphabet,
+        builder=_builder,
+        **options,
+    )
+    return dispatcher.run()
 
 
 # --- hmmpress ---------------------------------------------------------------
 
 def hmmpress(
-    hmms: typing.Iterable[HMM], output: typing.Union[str, "os.PathLike[str]"],
+    hmms: typing.Iterable[HMM],
+    output: typing.Union[str, "os.PathLike[str]"],
 ) -> int:
     """Press several HMMs into a database.
 
@@ -714,7 +894,7 @@ def hmmpress(
             # build the optimized models
             gm = Profile(hmm.M, hmm.alphabet)
             gm.configure(hmm, bg, DEFAULT_L)
-            om = gm.optimized()
+            om = gm.to_optimized()
 
             # update the disk offsets of the optimized model to be written
             om.offsets.model = h3m.tell()
@@ -742,9 +922,10 @@ def hmmpress(
 
 def hmmalign(
     hmm: HMM,
-    sequences: typing.Collection[DigitalSequence],
-    trim: bool = False,
+    sequences: typing.Iterable[DigitalSequence],
+    *,
     digitize: bool = False,
+    trim: bool = False,
     all_consensus_cols: bool = True,
 ) -> MSA:
     """Align several sequences to a reference HMM, and return the MSA.
@@ -752,8 +933,10 @@ def hmmalign(
     Arguments:
         hmm (`~pyhmmer.plan7.HMM`): The reference HMM to use for the
             alignment.
-        sequences (collection of `~pyhmmer.easel.DigitalSequence`): The
-            sequences to align to the HMM.
+        sequences (iterable of `~pyhmmer.easel.DigitalSequence`): The
+            sequences to align to the HMM. If you plan on using the
+            same sequences several times, consider storing them into
+            a `~pyhmmer.easel.DigitalSequenceBlock` directly.
         trim (`bool`): Trim off any residues that get assigned to
             flanking :math:`N` and :math:`C` states (in profile traces)
             or :math:`I_0` and :math:`I_m` (in core traces).
@@ -777,6 +960,8 @@ def hmmalign(
 
     """
     aligner = TraceAligner()
+    if not isinstance(sequences, DigitalSequenceBlock):
+        sequences = DigitalSequenceBlock(hmm.alphabet, sequences)
     traces = aligner.compute_traces(hmm, sequences)
     return aligner.align_traces(
         hmm,
@@ -784,9 +969,132 @@ def hmmalign(
         traces,
         trim=trim,
         digitize=digitize,
-        all_consensus_cols=all_consensus_cols
+        all_consensus_cols=all_consensus_cols,
     )
 
+
+# --- hmmscan ----------------------------------------------------------------
+
+def hmmscan(
+    queries: typing.Union[DigitalSequence, typing.Iterable[DigitalSequence]],
+    profiles: typing.Iterable[typing.Union[HMM, Profile, OptimizedProfile]],
+    *,
+    cpus: int = 0,
+    callback: typing.Optional[typing.Callable[[DigitalSequence, int], None]] = None,
+    background: typing.Optional[Background] = None,
+    **options,  # type: typing.Dict[str, object]
+) -> typing.Iterator[TopHits]:
+    """Scan query sequences against a profile database.
+
+    In HMMER many-to-many comparisons, a *scan* is the operation of querying
+    with sequences a database of profile HMMs. It is necessary slower than
+    a *search* because reconfiguring profiles between each queries has
+    additional overhead, so it's recommended to use a *search* if the order
+    of the comparisons is not important.
+
+    The `hmmscan` function offers two ways of managing the database that will
+    be selected based on the type of the ``profiles`` argument. If
+    ``profiles`` is an `HMMPressedFile` object, `hmmscan` will reopen the
+    file in each thread, and load profiles *iteratively* to scan with the
+    query. Otherwise, it will *pre-fetch* the optimized profiles into an
+    `OptimizedProfileBlock` collection, and share them across queries. The
+    *pre-fetching* gives much higher performance at the cost of extra
+    startup time and much higher memory consumption. You may want to check
+    how much memory is available (for instance with `psutil.virtual_memory`)
+    before trying to load a whole pHMM database.
+
+    Arguments:
+        queries (iterable of `DigitalSequence`): The query sequences to scan
+            with the database. Passing a single query is supported.
+        profiles (iterable of `HMM`, `Profile` or `OptimizedProfile`): A
+            database of profiles to query. If you plan on using the
+            same targets several times, consider converting them into
+            `OptimizedProfile` and storing them into an `OptimizedProfileBlock`
+            ahead of time. If a `HMMPressedFile` is given, profiles will be
+            loaded iteratively from disk rather than prefetched.
+        cpus (`int`): The number of threads to run in parallel. Pass ``1``
+            to run everything in the main thread, ``0`` to automatically
+            select a suitable number (using `psutil.cpu_count`), or any
+            positive number otherwise.
+        callback (callable): A callback that is called everytime a query is
+            processed with two arguments: the query, and the total number
+            of queries. This can be used to display progress in UI.
+        background (`pyhmmer.plan7.Background`, *optional*): A background
+            object to use for configuring the profiles. If `None` given,
+            create a default one.
+
+    Yields:
+        `~pyhmmer.plan7.TopHits`: An object reporting *top hits* for each
+        query, in the same order the queries were passed in the input.
+
+    Raises:
+        `~pyhmmer.errors.AlphabetMismatch`: When any of the query sequence
+            and the profile do not share the same alphabet.
+
+    Note:
+        Any additional keyword arguments passed to the `phmmer` function
+        will be passed transparently to the `~pyhmmer.plan7.Pipeline` to
+        be created in each worker thread.
+
+    Hint:
+        If reading the profiles from a pressed HMM database, make sure to
+        use the `HMMFile.optimized_profiles` method so that profiles are
+        read iteratively from the file during the scan loop::
+
+            >>> with HMMFile("tests/data/hmms/db/t2pks.hmm") as hmm_file:
+            ...     targets = hmm_file.optimized_profiles()
+            ...     all_hits = list(hmmscan(proteins, targets, E=1e-10))
+            >>> sum(len(hits) for hits in all_hits)
+            26
+
+        Otherwise, passing ``hmm_file`` as the ``profiles`` argument of
+        `hmmscan` would cause the entire HMM file to be loaded in memory
+        into an `OptimizedProfileBlock` otherwise.
+
+    .. versionadded:: 0.7.0
+
+    """
+    _alphabet = Alphabet.amino()
+    _cpus = cpus if cpus > 0 else psutil.cpu_count(logical=False) or os.cpu_count() or 1
+    _background = Background(_alphabet) if background is None else background
+    options.setdefault("background", _background)  # type: ignore
+
+    if not isinstance(queries, collections.abc.Iterable):
+        queries = (queries,)
+    if isinstance(profiles, HMMPressedFile):
+        alphabet = _alphabet # FIXME: try to detect from content instead?
+        targets = profiles
+    elif isinstance(profiles, OptimizedProfileBlock):
+        alphabet = profiles.alphabet
+        targets = profiles  # type: ignore
+    else:
+        alphabet = _alphabet
+        block = OptimizedProfileBlock(_alphabet)
+        for item in profiles:
+            if isinstance(item, HMM):
+                profile = Profile(item.M, item.alphabet)
+                profile.configure(item, _background)
+                item = profile
+            if isinstance(item, Profile):
+                item = item.to_optimized()
+            if isinstance(item, OptimizedProfile):
+                block.append(item)
+            else:
+                ty = type(item).__name__
+                raise TypeError("Expected HMM, Profile or OptimizedProfile, found {}".format(ty))
+        targets = block  # type: ignore
+
+    dispatcher = _SCANDispatcher(
+        queries=queries,
+        targets=targets,
+        cpus=_cpus,
+        callback=callback,
+        pipeline_class=Pipeline,
+        alphabet=alphabet,
+        builder=None,
+        **options,
+    )
+    return dispatcher.run()
 
 # add a very limited CLI so that this module can be invoked in a shell:
 #     $ python -m pyhmmer.hmmsearch <hmmfile> <seqdb>
@@ -795,79 +1103,117 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    def _hmmsearch(args: argparse.Namespace) -> int:
-        try:
-            with SequenceFile(args.seqdb, digital=True) as seqfile:
-                sequences: typing.List[DigitalSequence] = list(seqfile)  # type: ignore
-        except EOFError as err:
-            print(err, file=sys.stderr)
-            return 1
+    # don't load target databases in memory if they would take more than
+    # 90% of the remainining available memory (because more memory will be
+    # needed afterwards to allocate the `TopHits` for each query)
+    MAX_MEMORY_LOAD = 0.80
 
-        with HMMFile(args.hmmfile) as hmms:
-            queries = hmms.optimized_profiles() if hmms.is_pressed() else hmms
-            hits_list = hmmsearch(queries, sequences, cpus=args.jobs)  # type: ignore
-            for hits in hits_list:
-                for hit in hits:
-                    if hit.is_reported():
-                        print(
-                            hit.name.decode(),
-                            "-",
-                            hit.best_domain.alignment.hmm_accession.decode(),
-                            hit.best_domain.alignment.hmm_name.decode(),
-                            hit.evalue,
-                            hit.score,
-                            hit.bias,
-                            sep="\t",
-                        )
+    def _hmmsearch(args: argparse.Namespace) -> int:
+        # check the size of the target database and the amount of available memory
+        available_memory = psutil.virtual_memory().available
+        database_size = os.stat(args.seqdb).st_size
+
+        with SequenceFile(args.seqdb, digital=True) as sequences:
+            # pre-load the database if it is small enough to fit in memory
+            if database_size < available_memory * MAX_MEMORY_LOAD:
+                sequences = sequences.read_block()  # type: ignore
+            # load the query HMMs iteratively
+            with HMMFile(args.hmmfile) as hmms:
+                if hmms.is_pressed():
+                    hmms = hmms.optimized_profiles()  # type: ignore
+                hits_list = hmmsearch(hmms, sequences, cpus=args.jobs)  # type: ignore
+                for hits in hits_list:
+                    for hit in hits:
+                        if hit.reported:
+                            print(
+                                hit.name.decode(),
+                                (hit.accession or b"-").decode(),
+                                (hits.query_name or b"-").decode(),
+                                (hits.query_accession or b"-").decode(),
+                                hit.evalue,
+                                hit.score,
+                                hit.bias,
+                                sep="\t",
+                            )
 
         return 0
 
     def _phmmer(args: argparse.Namespace) -> int:
+        # check the size of the target database and the amount of available memory
+        available_memory = psutil.virtual_memory().available
+        database_size = os.stat(args.seqdb).st_size
+
         alphabet = Alphabet.amino()
-
-        with SequenceFile(args.seqdb, digital=True, alphabet=alphabet) as seqfile:
-            sequences = list(seqfile)
-
-        with SequenceFile(args.seqfile, digital=True, alphabet=alphabet) as queries:
-            hits_list = phmmer(queries, sequences, cpus=args.jobs)  # type: ignore
-
-            for hits in hits_list:
-                for hit in hits:
-                    if hit.is_reported():
-                        print(
-                            hit.name.decode(),
-                            "-",
-                            hit.best_domain.alignment.hmm_accession.decode(),
-                            hit.best_domain.alignment.hmm_name.decode(),
-                            hit.evalue,
-                            hit.score,
-                            hit.bias,
-                            sep="\t",
-                        )
+        with SequenceFile(args.seqdb, digital=True, alphabet=alphabet) as sequences:
+            # pre-load the database if it is small enough to fit in memory
+            if database_size < available_memory * MAX_MEMORY_LOAD:
+                sequences = sequences.read_block()  # type: ignore
+            # load the query sequences iteratively
+            with SequenceFile(args.seqfile, digital=True, alphabet=alphabet) as queries:
+                hits_list = phmmer(queries, sequences, cpus=args.jobs)  # type: ignore
+                for hits in hits_list:
+                    for hit in hits:
+                        if hit.reported:
+                            print(
+                                hit.name.decode(),
+                                "-",
+                                hit.best_domain.alignment.hmm_accession.decode(),
+                                hit.best_domain.alignment.hmm_name.decode(),
+                                hit.evalue,
+                                hit.score,
+                                hit.bias,
+                                sep="\t",
+                            )
 
         return 0
 
     def _nhmmer(args: argparse.Namespace) -> int:
+        # at the moment `LongTargetsPipeline` only support block targets, not files
         with SequenceFile(args.seqdb, digital=True) as seqfile:
-            sequences = list(seqfile)
+            with SequenceFile(args.seqfile, digital=True) as queryfile:
+                hits_list = nhmmer(queryfile, seqfile, cpus=args.jobs)  # type: ignore
+                for hits in hits_list:
+                    for hit in hits:
+                        if hit.reported:
+                            print(
+                                hit.name.decode(),
+                                "-",
+                                hit.best_domain.alignment.hmm_accession.decode(),
+                                hit.best_domain.alignment.hmm_name.decode(),
+                                hit.evalue,
+                                hit.score,
+                                hit.bias,
+                                sep="\t",
+                            )
 
-        with SequenceFile(args.seqfile, digital=True) as queryfile:
-            queries = list(queryfile)
-            hits_list = nhmmer(queries, sequences, cpus=args.jobs)  # type: ignore
-            for hits in hits_list:
-                for hit in hits:
-                    if hit.is_reported():
-                        print(
-                            hit.name.decode(),
-                            "-",
-                            hit.best_domain.alignment.hmm_accession.decode(),
-                            hit.best_domain.alignment.hmm_name.decode(),
-                            hit.evalue,
-                            hit.score,
-                            hit.bias,
-                            sep="\t",
-                        )
+        return 0
 
+    def _hmmscan(args: argparse.Namespace) -> int:
+        # check the size of the target database and the amount of available memory
+        available_memory = psutil.virtual_memory().available
+        database_size = os.stat(args.hmmdb).st_size
+
+        with SequenceFile(args.seqfile, digital=True) as seqfile:
+            with HMMFile(args.hmmdb) as hmms:
+                # pre-load profiles is they can fit into memory
+                targets = hmms.optimized_profiles() if hmms.is_pressed() else hmms
+                if hmms.is_pressed() and database_size < available_memory * MAX_MEMORY_LOAD:
+                    targets = OptimizedProfileBlock(seqfile.alphabet, targets)  # type: ignore
+                # load the query sequences iteratively
+                hits_list = hmmscan(seqfile, targets, cpus=args.jobs)  # type: ignore
+                for hits in hits_list:
+                    for hit in hits:
+                        if hit.reported:
+                            print(
+                                hit.name.decode(),
+                                (hit.accession or b"-").decode(),
+                                (hits.query_name or b"-").decode(),
+                                (hits.query_accession or b"-").decode(),
+                                hit.evalue,
+                                hit.score,
+                                hit.bias,
+                                sep="\t",
+                            )
         return 0
 
     def _hmmpress(args: argparse.Namespace) -> int:
@@ -931,6 +1277,11 @@ if __name__ == "__main__":
     parser_nhmmer.add_argument("seqfile")
     parser_nhmmer.add_argument("seqdb")
 
+    parser_hmmsearch = subparsers.add_parser("hmmscan")
+    parser_hmmsearch.set_defaults(call=_hmmscan)
+    parser_hmmsearch.add_argument("hmmdb")
+    parser_hmmsearch.add_argument("seqfile")
+
     parser_hmmpress = subparsers.add_parser("hmmpress")
     parser_hmmpress.set_defaults(call=_hmmpress)
     parser_hmmpress.add_argument("hmmfile")
@@ -938,10 +1289,7 @@ if __name__ == "__main__":
 
     parser_hmmalign = subparsers.add_parser("hmmalign")
     parser_hmmalign.set_defaults(call=_hmmalign)
-    parser_hmmalign.add_argument(
-        "hmmfile",
-        metavar="<hmmfile>"
-    )
+    parser_hmmalign.add_argument("hmmfile", metavar="<hmmfile>")
     parser_hmmalign.add_argument(
         "seqfile",
         metavar="<seqfile>",
@@ -952,12 +1300,12 @@ if __name__ == "__main__":
         action="store",
         default="-",
         metavar="<f>",
-        help="output alignment to file <f>, not stdout"
+        help="output alignment to file <f>, not stdout",
     )
     parser_hmmalign.add_argument(
         "--trim",
         action="store_true",
-        help="trim terminal tails of nonaligned residues from alignment"
+        help="trim terminal tails of nonaligned residues from alignment",
     )
     parser_hmmalign.add_argument(
         "--informat",

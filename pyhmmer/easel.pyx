@@ -22,22 +22,24 @@ ELIF UNAME_SYSNAME == "Darwin" or UNAME_SYSNAME.endswith("BSD"):
 cimport cython
 from cpython cimport Py_buffer
 from cpython.buffer cimport PyBUF_FORMAT, PyBUF_READ
-from cpython.bytes cimport PyBytes_FromString, PyBytes_FromStringAndSize
+from cpython.bytes cimport PyBytes_FromString, PyBytes_FromStringAndSize, PyBytes_AsString
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
 from cpython.memoryview cimport PyMemoryView_FromMemory
 from cpython.ref cimport Py_INCREF
 from cpython.tuple cimport PyTuple_New, PyTuple_SET_ITEM
 from cpython.unicode cimport PyUnicode_DecodeASCII
-from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdint cimport int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, SIZE_MAX
 from libc.stdio cimport fclose
 from libc.stdlib cimport calloc, malloc, realloc, free
-from libc.string cimport memcmp, memcpy, memmove, strdup, strlen, strncpy
+from libc.string cimport memcmp, memcpy, memmove, memset, strdup, strlen, strncpy
 from posix.types cimport off_t
+from unicode cimport PyUnicode_New, PyUnicode_DATA, PyUnicode_KIND, PyUnicode_WRITE, PyUnicode_READY, PyUnicode_READ, Py_UCS4
 
 cimport libeasel
 cimport libeasel.alphabet
 cimport libeasel.bitfield
 cimport libeasel.buffer
+cimport libeasel.gencode
 cimport libeasel.keyhash
 cimport libeasel.matrixops
 cimport libeasel.msa
@@ -50,9 +52,11 @@ cimport libeasel.ssi
 cimport libeasel.vec
 from libeasel cimport ESL_DSQ, esl_pos_t
 from libeasel.buffer cimport ESL_BUFFER
+from libeasel.gencode cimport ESL_GENCODE
 from libeasel.sq cimport ESL_SQ
 from libeasel.sqio cimport ESL_SQFILE, ESL_SQASCII_DATA
 from libeasel.random cimport ESL_RANDOMNESS
+from capacity cimport new_capacity
 
 from .reexports.esl_sqio_ascii cimport (
     loadbuf,
@@ -86,12 +90,17 @@ from .reexports.esl_sqio_ascii cimport (
     fileheader_hmmpgmd,
 )
 
+include "exceptions.pxi"
+
+
 # --- Python imports ---------------------------------------------------------
 
 import abc
 import array
 import io
+import itertools
 import os
+import operator
 import collections
 import pickle
 import sys
@@ -198,11 +207,8 @@ cdef class Alphabet:
         alphabet._init_default(libeasel.alphabet.eslRNA)
         return alphabet
 
-    # def __init__(self, str alphabet, int K, int Kp):
-    #     buffer = alphabet.encode('ascii')
-    #     self._alphabet = libeasel.alphabet.esl_alphabet_CreateCustom(<char*> buffer, K, Kp)
-    #     if not self._alphabet:
-    #         raise AllocationError("ESL_ALPHABET")
+    def __init__(self):
+        raise TypeError("Cannot instantiate an alphabet directly")
 
     # --- Magic methods ------------------------------------------------------
 
@@ -345,31 +351,320 @@ cdef class Alphabet:
           or self._abc.type == libeasel.alphabet.eslRNA
         )
 
+    cpdef VectorU8 encode(self, str sequence):
+        """encode(self, sequence)\n--
+
+        Encode a raw text sequence into its digital representation.
+
+        Arguments:
+            sequence (`str`): A raw sequence in text format.
+
+        Returns:
+            `~pyhmmer.easel.VectorU8`: A raw sequence in digital format.
+
+        Example:
+            >>> alphabet = easel.Alphabet.dna()
+            >>> alphabet.encode("ACGT")
+            pyhmmer.easel.VectorU8([0, 1, 2, 3])
+
+        .. versionadded:: 0.6.3
+
+        """
+        assert self._abc != NULL
+
+        # make sure the unicode string is in canonical form,
+        # --> won't be needed anymore in Python 3.12
+        IF SYS_VERSION_INFO_MAJOR <= 3 and SYS_VERSION_INFO_MINOR < 12:
+            PyUnicode_READY(sequence)
+
+        cdef size_t   i
+        cdef Py_UCS4  c
+        cdef size_t   length  = len(sequence)
+        cdef int      kind    = PyUnicode_KIND(sequence)
+        cdef void*    data    = PyUnicode_DATA(sequence)
+        cdef VectorU8 encoded = VectorU8.zeros(length)
+        cdef uint8_t* buffer  = <uint8_t*> encoded._data
+
+        with nogil:
+            for i in range(length):
+                c = PyUnicode_READ(kind, data, i)
+                if libeasel.alphabet.esl_abc_CIsValid(self._abc, c):
+                    buffer[i] = libeasel.alphabet.esl_abc_DigitizeSymbol(self._abc, c)
+                else:
+                    raise ValueError(f"Invalid alphabet character in text sequence: {c}")
+
+        return encoded
+
+    cpdef str decode(self, const libeasel.ESL_DSQ[::1] sequence):
+        """decode(self, sequence)\n--
+
+        Decode a raw digital sequence into its textual representation.
+
+        Arguments:
+            sequence (`object`, *buffer-like*): A raw sequence in digital
+                format. Any object implementing the buffer protocol (like
+                `bytearray`, `~pyhmmer.easel.VectorU8`, etc.) may be given.
+
+        Returns:
+            `str`: A raw sequence in textual format.
+
+        Example:
+            >>> alphabet = easel.Alphabet.amino()
+            >>> dseq = easel.VectorU8([0, 4, 2, 17, 3, 13, 0, 0, 5])
+            >>> alphabet.decode(dseq)
+            'AFDVEQAAG'
+
+        .. versionadded:: 0.6.3
+
+        """
+        assert self._abc != NULL
+
+        cdef libeasel.ESL_DSQ x
+        cdef size_t           i
+        cdef size_t           length  = sequence.shape[0]
+
+        # NB(@althonos): Compatibility code for PyPy 3.6, which does
+        #                not support directly writing to a string. Remove
+        #                when Python 3.6 support is dropped.
+        IF SYS_VERSION_INFO_MAJOR <= 3 and SYS_VERSION_INFO_MINOR <= 7 and SYS_IMPLEMENTATION_NAME == "pypy":
+            cdef bytes decoded = PyBytes_FromStringAndSize(NULL, length)
+            cdef char* data    = PyBytes_AsString(decoded)
+
+            with nogil:
+                for i in range(length):
+                    x = sequence[i]
+                    if libeasel.alphabet.esl_abc_XIsValid(self._abc, x):
+                        data[i] = self._abc.sym[x]
+                    else:
+                        raise ValueError(f"Invalid alphabet character in digital sequence: {x}")
+
+            return decoded.decode('ascii')
+
+        ELSE:
+            cdef str   decoded = PyUnicode_New(length, 0x7F)
+            cdef int   kind    = PyUnicode_KIND(decoded)
+            cdef void* data    = PyUnicode_DATA(decoded)
+
+            with nogil:
+                for i in range(length):
+                    x = sequence[i]
+                    if libeasel.alphabet.esl_abc_XIsValid(self._abc, x):
+                        PyUnicode_WRITE(kind, data, i, self._abc.sym[x])
+                    else:
+                        raise ValueError(f"Invalid alphabet character in digital sequence: {x}")
+
+            return decoded
+
+
+# --- GeneticCode ------------------------------------------------------------
+
+cdef class GeneticCode:
+    """A genetic code table for translation.
+
+    .. versionadded:: 0.7.2
+
+    """
+
+    def __cinit__(self):
+        self._gcode = NULL
+
+    def __dealloc__(self):
+        libeasel.gencode.esl_gencode_Destroy(self._gcode)
+
+    def __init__(
+        self,
+        int translation_table = 1,
+        *,
+        Alphabet nucleotide_alphabet not None = Alphabet.dna(),
+        Alphabet amino_alphabet not None = Alphabet.amino(),
+    ):
+        """__init__(self, translation_table=1, *, nucleotide_alphabet=Alphabet.dna(), amino_alphabet=Alphabet.amino())\n--
+
+        Create a new genetic code for translating nucleotide sequences.
+
+        Arguments:
+            translation_table (`int`): The translation table to use. Check the
+                `Wikipedia <https://w.wiki/47wo>`_ page listing all genetic
+                codes for the available values.
+            nucleotide_alphabet (`pyhmmer.easel.Alphabet`): The nucleotide
+                alphabet from which to translate the sequence.
+            amino_alphabet (`pyhmmer.easel.Alphabet`): The target alphabet
+                into which to translate the sequence.
+
+        """
+        cdef int status
+
+        if not nucleotide_alphabet.is_nucleotide():
+            raise ValueError(f"Invalid nucleotide alphabet {nucleotide_alphabet!r}")
+        if not amino_alphabet.is_amino():
+            raise ValueError(f"Invalid amino alphabet {amino_alphabet!r}")
+
+        self._gcode = libeasel.gencode.esl_gencode_Create(nucleotide_alphabet._abc, amino_alphabet._abc)
+        if self._gcode == NULL:
+            raise AllocationError("ESL_GENCODE", sizeof(ESL_GENCODE))
+
+        self.amino_alphabet = amino_alphabet
+        self.nucleotide_alphabet = nucleotide_alphabet
+        self.translation_table = translation_table
+
+    @property
+    def translation_table(self):
+        """`int`: The translation table in use.
+
+        Can be set manually to a different number to change the
+        translation table for the current `GeneticCode` object.
+
+        """
+        assert self._gcode != NULL
+        return self._gcode.transl_table
+
+    @translation_table.setter
+    def translation_table(self, int translation_table):
+        assert self._gcode != NULL
+        status = libeasel.gencode.esl_gencode_Set(self._gcode, translation_table)
+        if status == libeasel.eslENOTFOUND:
+            raise ValueError(f"Invalid translation table: {translation_table!r}")
+        elif status != libeasel.eslOK:
+            raise UnexpectedError(status, "esl_gencode_Set")
+
+    @property
+    def description(self):
+        """`str`: A description of the translation table currently in use.
+        """
+        assert self._gcode != NULL
+        return self._gcode.desc.decode('ascii')
+
+    cdef void _translate(
+        self,
+        const ESL_DSQ* seq,
+        int64_t seqlen,
+        ESL_DSQ* out,
+        int64_t outlen
+    ) nogil except *:
+        cdef int     aa
+        cdef int64_t i
+        cdef int64_t j
+
+        if seqlen % 3 != 0:
+            raise ValueError(f"Invalid sequence of length {seqlen!r}")
+        if outlen < seqlen // 3:
+            raise BufferError(f"Output buffer too short for sequence of length {seqlen // 3!r}")
+
+        for i, j in enumerate(range(0, seqlen, 3)):
+            aa = libeasel.gencode.esl_gencode_GetTranslation(self._gcode, <ESL_DSQ*> &seq[j])
+            if aa == -1:
+                raise ValueError(f"Failed to translate codon at index {j!r}")
+            out[i] = aa
+
+    cpdef VectorU8 translate(self, const ESL_DSQ[::1] sequence):
+        """translate(self, sequence)\n--
+
+        Translate a raw nucleotide sequence into a protein.
+
+        Arguments:
+            sequence (`object`, *buffer-like*): A raw sequence in digital
+                format. Any object implementing the buffer protocol (like
+                `bytearray`, `~pyhmmer.easel.VectorU8`, etc.) may be given.
+
+        Returns:
+            `pyhmmer.easel.VectorU8`: The translation of the input
+            sequence, as a raw digital sequence.
+
+        Raises:
+            `ValueError`: When ``sequence`` could not be translated
+                properly, because of a codon could not be recognized, or
+                because the sequence has an invalid length.
+
+        Note:
+            The translation of a DNA/RNA codon supports ambiguous codons.
+            If the amino acid is unambiguous, despite codon ambiguity,
+            the correct amino acid is still determined: ``GGR`` translates
+            as ``Gly``, ``UUY`` as ``Phe``, etc. If there is no single
+            unambiguous amino acid translation, the codon is translated
+            as ``X``. Ambiguous amino acids (such as ``J`` or ``B``) are
+            never produced.
+
+        """
+        cdef int64_t  nlen = sequence.shape[0]
+        cdef int64_t  alen = nlen // 3
+        cdef VectorU8 prot = VectorU8.zeros(alen)
+
+        if sequence.shape[0] > 0:
+            with nogil:
+                self._translate(&sequence[0], nlen, <ESL_DSQ*> prot._data, alen)
+
+        return prot
+
 
 # --- Bitfield ---------------------------------------------------------------
 
 cdef class Bitfield:
     """A statically sized sequence of booleans stored as a packed bitfield.
 
-    A bitfield is instantiated with a fixed length, and all booleans are set
-    to `False` by default::
+    Example:
+        Instantiate a bitfield from an iterable, where each object will be
+        tested for truth:
 
-        >>> bitfield = Bitfield(8)
-        >>> len(bitfield)
-        8
-        >>> bitfield[0]
-        False
+            >>> bitfield = Bitfield([True, False, False])
+            >>> len(bitfield)
+            3
+            >>> bitfield[0]
+            True
+            >>> bitfield[1]
+            False
 
-    Use indexing to access and edit individual bits::
+        Use `Bitfield.zeros` and `Bitfield.ones` to initialize a bitfield of
+        a given length with all fields set to :math:`0` or :math:`1`::
 
-        >>> bitfield[0] = True
-        >>> bitfield[0]
-        True
-        >>> bitfield[0] = False
-        >>> bitfield[0]
-        False
+            >>> Bitfield.zeros(4)
+            pyhmmer.easel.Bitfield([False, False, False, False])
+            >>> Bitfield.ones(4)
+            pyhmmer.easel.Bitfield([True, True, True, True])
+
+        Use indexing to access and edit individual bits::
+
+            >>> bitfield[0] = True
+            >>> bitfield[0]
+            True
+            >>> bitfield[0] = False
+            >>> bitfield[0]
+            False
 
     """
+
+    # --- Class methods ------------------------------------------------------
+
+    @classmethod
+    def zeros(cls, size_t n):
+        """zeros(cls, n, /)\n--
+
+        Create a new bitfield of size ``n`` with all elements set to `False`.
+
+        .. versionadded:: 0.7.0
+
+        """
+        if n <= 0:
+            raise ValueError("Cannot create an empty `Bitfield`")
+        cdef Bitfield bitfield = Bitfield.__new__(Bitfield)
+        bitfield._shape[0] = (n + 63) // 64
+        bitfield._b = libeasel.bitfield.esl_bitfield_Create(n)
+        if not bitfield._b:
+            raise AllocationError("ESL_BITFIELD", sizeof(ESL_BITFIELD))
+        return bitfield
+
+    @classmethod
+    def ones(cls, size_t n):
+        """ones(cls, n, /)\n--
+
+        Create a new bitfield of size ``n`` with all elements set to `True`.
+
+        .. versionadded:: 0.7.0
+
+        """
+        cdef Bitfield bitfield = cls.zeros(n)
+        with nogil:
+            memset(bitfield._b.b, 0xFF, bitfield._shape[0]*sizeof(uint64_t))
+        return bitfield
 
     # --- Magic methods ------------------------------------------------------
 
@@ -380,28 +675,33 @@ cdef class Bitfield:
     def __dealloc__(self):
         libeasel.bitfield.esl_bitfield_Destroy(self._b)
 
-    def __init__(self, size_t length):
-        """__init__(self, length)\n--
+    def __init__(self, object iterable):
+        """__init__(self, iterable)\n--
 
-        Create a new bitfield with the given ``length``.
+        Create a new bitfield from an iterable of objects.
+
+        Objects yielded by the iterable can be of any type and will be
+        tested for truth before setting the corresponding field.
 
         Raises:
-            `ValueError`: When given a zero `length`.
+            `ValueError`: When given an empty iterable.
 
         """
-        if length == 0:
-            raise ValueError("Cannot create an empty `Bitfield`")
-        else:
-            self._shape[0] = (length + 63) // 64
+        if not isinstance(iterable, collections.abc.Sized):
+            iterable = list(iterable)
 
-        # NB: checking whether `self._b` is not NULL before allocating allows
-        #     calling __init__ more than once without causing a memory leak.
-        if self._b != NULL:
-            libeasel.bitfield.esl_bitfield_Destroy(self._b)
-        with nogil:
-            self._b = libeasel.bitfield.esl_bitfield_Create(length)
+        cdef size_t n = len(iterable)
+        if n <= 0:
+            raise ValueError("Cannot create an empty `Bitfield`")
+
+        self._shape[0] = (n + 63) // 64
+        self._b = libeasel.bitfield.esl_bitfield_Create(n)
         if not self._b:
             raise AllocationError("ESL_BITFIELD", sizeof(ESL_BITFIELD))
+
+        for i, item in enumerate(iterable):
+            if item:
+                libeasel.bitfield.esl_bitfield_Set(self._b, i)
 
     def __len__(self):
         assert self._b != NULL
@@ -442,6 +742,16 @@ cdef class Bitfield:
 
         return NotImplemented
 
+    def __repr__(self):
+        cdef type ty   = type(self)
+        cdef str  name = ty.__name__
+        cdef str  mod  = ty.__module__
+        return f"{mod}.{name}({list(self)!r})"
+
+    def __reduce_ex__(self, int protocol):
+        assert self._b != NULL
+        return self.zeros, (len(self),), self.__getstate__()
+
     def __getstate__(self):
         assert self._b != NULL
 
@@ -454,12 +764,19 @@ cdef class Bitfield:
         return {"nb": self._b.nb, "b": b}
 
     def __setstate__(self, state):
-        self.__init__(state["nb"])
-
-        cdef size_t        nu = (self._b.nb // 64) + (self._b.nb % 64 != 0)
+        cdef size_t        nb = state["nb"]
+        cdef size_t        nu = (nb // 64) + (nb % 64 != 0)
         cdef uint64_t[::1] b  = state["b"]
 
-        assert b.shape[0] <= <ssize_t> nu
+        if nb <= 0:
+            raise ValueError("Cannot create an empty `Bitfield`")
+
+        if self._b == NULL:
+            self._b = libeasel.bitfield.esl_bitfield_Create(nb)
+        else:
+            self._b.nb = nb
+            self._b.b  = <uint64_t*> realloc(self._b.b, nu * sizeof(uint64_t))
+
         with nogil:
             memcpy(self._b.b, &b[0], nu * sizeof(uint64_t))
 
@@ -467,6 +784,12 @@ cdef class Bitfield:
         assert self._b != NULL
         cdef size_t nu = (self._b.nb // 64) + (self._b.nb % 64 != 0)
         return sizeof(uint64_t) * nu + sizeof(ESL_BITFIELD) + sizeof(self)
+
+    def __copy__(self):
+        return self.copy()
+
+    def __deepcopy__(self, memo):
+        return self.copy()
 
     def __getbuffer__(self, Py_buffer* buffer, int flags):
         assert self._b != NULL
@@ -505,7 +828,7 @@ cdef class Bitfield:
         If no argument is given, counts the number of `True` occurences.
 
         Example:
-            >>> bitfield = Bitfield(8)
+            >>> bitfield = Bitfield.zeros(8)
             >>> bitfield.count(False)
             8
             >>> bitfield[0] = bitfield[1] = True
@@ -519,13 +842,27 @@ cdef class Bitfield:
             count_ = libeasel.bitfield.esl_bitfield_Count(self._b)
         return count_ if value else self._b.nb - count_
 
+    cpdef Bitfield copy(self):
+        """copy(self)\n--
+
+        Return a copy of this bitfield object.
+
+        .. versionadded:: 0.7.0
+
+        """
+        assert self._b != NULL
+        cdef Bitfield copy = type(self).zeros(self._b.nb)
+        with nogil:
+            memcpy(copy._b.b, self._b.b, self._shape[0]*sizeof(uint64_t))
+        return copy
+
     cpdef void toggle(self, int index) except *:
         """toggle(self, index)\n--
 
         Switch the value of one single bit.
 
         Example:
-            >>> bitfield = Bitfield(8)
+            >>> bitfield = Bitfield.zeros(8)
             >>> bitfield[0]
             False
             >>> bitfield.toggle(0)
@@ -858,21 +1195,30 @@ cdef class Vector:
         return vec
 
     @classmethod
-    def _from_raw_bytes(cls, buffer, int n):
-        """_from_raw_bytes(cls, buffer, n)\n--
+    def _from_raw_bytes(cls, object buffer, int n, str byteorder):
+        f"""_from_raw_bytes(cls, buffer, n, byteorder)\n--
 
         Create a new vector using the given bytes to fill its contents.
 
         """
-        cdef Vector       vec      = cls.zeros(n)
-        cdef size_t       itemsize = vec.itemsize
-        cdef object       view     = memoryview(buffer)
-        cdef uint8_t[::1] bytes    = view.cast("B")
+        cdef const uint8_t[::1] bytes
+        cdef Vector             vec      = cls.zeros(n)
+        cdef size_t             itemsize = vec.itemsize
+        cdef object             view     = memoryview(buffer)
 
+        # fix endianness if needed
+        if byteorder != SYS_BYTEORDER and vec.itemsize > 1:
+            newbuffer = array.array(vec.format)
+            newbuffer.frombytes(view)
+            newbuffer.byteswap()
+            view = memoryview(newbuffer)
+
+        # assign the items
+        bytes = view.cast("B")
         assert bytes.shape[0] == n * vec.itemsize
         if n > 0:
             with nogil:
-                memcpy(vec._data, &bytes[0], vec._n * itemsize)
+                memcpy(vec._data, &bytes[0], n * itemsize)
         return vec
 
     # --- Magic methods ------------------------------------------------------
@@ -888,8 +1234,8 @@ cdef class Vector:
             free(self._data)
         self._data = NULL
 
-    def __init__(self, object iterable = None):
-        """__init__(self, iterable=None)\n--
+    def __init__(self, object iterable = ()):
+        """__init__(self, iterable=())\n--
 
         Create a new vector from the given iterable of values.
 
@@ -960,7 +1306,7 @@ cdef class Vector:
             buffer = array.array(self.format)
             buffer.frombytes(memoryview(self).cast("b"))
 
-        return self._from_raw_bytes, (buffer, self._n)
+        return self._from_raw_bytes, (buffer, self._n, SYS_BYTEORDER)
 
     def __add__(Vector self, object other):
         assert self._data != NULL
@@ -1139,7 +1485,7 @@ cdef class VectorF(Vector):
 
     # --- Magic methods ------------------------------------------------------
 
-    def __init__(self, object iterable = None):
+    def __init__(self, object iterable = ()):
         cdef int        n
         cdef size_t     i
         cdef float      item
@@ -1147,12 +1493,10 @@ cdef class VectorF(Vector):
         cdef int        n_alloc
         cdef float*     data
 
-        # allow creating a new empty vector without arguments
-        if iterable is None:
-            iterable = ()
-            n = 0
-        else:
-            n = len(iterable)
+        # collect iterable if it's not a `Sized` object
+        if not isinstance(iterable, collections.abc.Sized):
+            iterable = array.array("f", iterable)
+        n = len(iterable)
 
         # make sure __init__ is only called once
         if self._data != NULL:
@@ -1574,7 +1918,7 @@ cdef class VectorU8(Vector):
 
     # --- Magic methods ------------------------------------------------------
 
-    def __init__(self, object iterable = None):
+    def __init__(self, object iterable = ()):
         cdef int          n
         cdef size_t       i
         cdef uint8_t      item
@@ -1582,12 +1926,10 @@ cdef class VectorU8(Vector):
         cdef int          n_alloc
         cdef uint8_t*     data
 
-        # allow creating a new empty vector without arguments
-        if iterable is None:
-            iterable = ()
-            n = 0
-        else:
-            n = len(iterable)
+        # collect iterable if it's not a `Sized` object
+        if not isinstance(iterable, collections.abc.Sized):
+            iterable = array.array("B", iterable)
+        n = len(iterable)
 
         # make sure __init__ is only called once
         if self._data != NULL:
@@ -1996,23 +2338,30 @@ cdef class Matrix:
         return mat
 
     @classmethod
-    def _from_raw_bytes(cls, buffer, int m, int n):
-        """_from_raw_bytes(cls, buffer, m, n)\n--
+    def _from_raw_bytes(cls, buffer, int m, int n, str byteorder):
+        """_from_raw_bytes(cls, buffer, m, n, byteorder)\n--
 
         Create a new matrix using the given bytes to fill its contents.
 
         """
-        cdef Matrix       mat      = cls.zeros(m, n)
-        cdef size_t       itemsize = mat.itemsize
-        cdef object       view     = memoryview(buffer)
-        cdef uint8_t[::1] bytes    = view.cast("B")
-        cdef float**      data     = <float**> mat._data
+        cdef const uint8_t[::1] bytes
+        cdef Matrix             mat      = cls.zeros(m, n)
+        cdef size_t             itemsize = mat.itemsize
+        cdef object             view     = memoryview(buffer)
+
+        # fix endianness if needed
+        if byteorder != SYS_BYTEORDER and mat.itemsize > 1:
+            newbuffer = array.array(mat.format)
+            newbuffer.frombytes(view)
+            newbuffer.byteswap()
+            view = memoryview(newbuffer)
 
         # assign the items
+        bytes = view.cast("B")
         assert bytes.shape[0] == m * n * itemsize
-        with nogil:
-            memcpy(data[0], &bytes[0], m * n * itemsize)
-
+        if n > 0 and m > 0:
+            with nogil:
+                memcpy(mat._data[0], &bytes[0], m * n * itemsize)
         return mat
 
     # --- Magic methods ------------------------------------------------------
@@ -2030,7 +2379,7 @@ cdef class Matrix:
             free(self._data)
         self._data = NULL
 
-    def __init__(self, object iterable = None):
+    def __init__(self, object iterable = ()):
         raise TypeError("Can't instantiate abstract class 'Matrix'")
 
     def __bool__(self):
@@ -2103,7 +2452,7 @@ cdef class Matrix:
             buffer = array.array(self.format)
             buffer.frombytes(memoryview(self).cast("b"))
 
-        return self._from_raw_bytes, (buffer, self._m, self._n)
+        return self._from_raw_bytes, (buffer, self._m, self._n, SYS_BYTEORDER)
 
     def __add__(Matrix self, object other):
         assert self._data != NULL
@@ -2248,13 +2597,17 @@ cdef class MatrixF(Matrix):
 
     # --- Magic methods ------------------------------------------------------
 
-    def __init__(self, object iterable):
+    def __init__(self, object iterable = ()):
         cdef size_t  i
         cdef size_t  j
         cdef object  row
         cdef float   val
         cdef object  peeking = peekable(iterable)
         cdef float** data    = NULL
+
+        # collect iterable if it's not a `Sized` object
+        if not isinstance(iterable, collections.abc.Sized):
+            iterable = [list(row) for row in iterable]
 
         # make sure __init__ is only called once
         if self._data != NULL:
@@ -2499,7 +2852,7 @@ cdef class MatrixU8(Matrix):
 
     # --- Magic methods ------------------------------------------------------
 
-    def __init__(self, object iterable):
+    def __init__(self, object iterable = ()):
         cdef int       i
         cdef int       j
         cdef object    row
@@ -2507,6 +2860,10 @@ cdef class MatrixU8(Matrix):
         cdef uint8_t** data    = NULL
         cdef object    peeking = peekable(iterable)
         cdef int       m_alloc
+
+        # collect iterable if it's not a `Sized` object
+        if not isinstance(iterable, collections.abc.Sized):
+            iterable = [list(row) for row in iterable]
 
         # make sure __init__ is only called once
         if self._data != NULL:
@@ -3525,10 +3882,11 @@ cdef class DigitalMSA(MSA):
            Allow creating an alignment from an iterable of `DigitalSequence`.
 
         """
-        cdef list    seqs  = [] if sequences is None else list(sequences)
-        cdef set     names = { seq.name for seq in seqs }
-        cdef int64_t alen  = len(seqs[0]) if seqs else -1
-        cdef int     nseq  = len(seqs) if seqs else 1
+        cdef DigitalSequence seq
+        cdef list            seqs  = [] if sequences is None else list(sequences)
+        cdef set             names = { seq.name for seq in seqs }
+        cdef int64_t         alen  = len(seqs[0]) if seqs else -1
+        cdef int             nseq  = len(seqs) if seqs else 1
 
         if len(names) != len(seqs):
             raise ValueError("duplicate names in alignment sequences")
@@ -3557,7 +3915,7 @@ cdef class DigitalMSA(MSA):
         if author is not None:
             self.author = author
         for i, seq in enumerate(seqs):
-            self._set_sequence(i, (<DigitalSequence> seq)._sq)
+            self._set_sequence(i, seq._sq)
 
 
     # --- Properties ---------------------------------------------------------
@@ -3662,6 +4020,11 @@ cdef class MSAFile:
     This class supports reading sequences stored in different formats, such
     as Stockholm, A2M, PSI-BLAST or Clustal.
 
+    Attributes:
+        name (`str`, *optional*): The name of the MSA file, if it was
+            created from a filename, or `None` if it wraps a file-like
+            object.
+
     Hint:
         Some Clustal files created by alignment tools other than Clustal
         (such as MUSCLE or MAFFT, for instance), may not contain the header
@@ -3723,6 +4086,7 @@ cdef class MSAFile:
 
     def __cinit__(self):
         self.alphabet = None
+        self.name = None
         self._msaf = NULL
 
     def __init__(
@@ -3782,6 +4146,7 @@ cdef class MSAFile:
             self._msaf = MSAFile._open_fileobj(file, fmt)
             status = libeasel.eslOK
         else:
+            self.name = os.fsdecode(fspath)
             status = libeasel.msafile.esl_msafile_Open(NULL, fspath, NULL, fmt, NULL, &self._msaf)
 
         # store a reference to the argument
@@ -3865,9 +4230,18 @@ cdef class MSAFile:
             raise ValueError("I/O operation on closed file.")
         return MSA_FILE_FORMATS_INDEX[self._msaf.format]
 
-    # --- Utils --------------------------------------------------------------
+    # --- Methods ------------------------------------------------------------
 
-    cdef Alphabet guess_alphabet(self):
+    cpdef void close(self):
+        """close(self)\n--
+
+        Close the file and free the resources used by the parser.
+
+        """
+        libeasel.msafile.esl_msafile_Close(self._msaf)
+        self._msaf = NULL
+
+    cpdef Alphabet guess_alphabet(self):
         """guess_alphabet(self)\n--
 
         Guess the alphabet of an open `MSAFile`.
@@ -3880,6 +4254,11 @@ cdef class MSAFile:
             `EOFError`: if the file is empty.
             `OSError`: if a parse error occurred.
             `ValueError`: if this methods is called after the file was closed.
+
+        Example:
+            >>> with MSAFile("tests/data/msa/laccase.clw") as mf:
+            ...     mf.guess_alphabet()
+            pyhmmer.easel.Alphabet.amino()
 
         """
         cdef int      ty
@@ -3895,7 +4274,7 @@ cdef class MSAFile:
             alphabet = Alphabet.__new__(Alphabet)
             alphabet._init_default(ty)
             return alphabet
-        elif status == libeasel.eslENOALPHABET:
+        elif status == libeasel.eslENOALPHABET or status == libeasel.eslEOD:
             return None
         elif status == libeasel.eslENODATA:
             raise EOFError("Sequence file appears to be empty.")
@@ -3904,17 +4283,6 @@ cdef class MSAFile:
             raise ValueError("Could not parse file: {}".format(msg))
         else:
             raise UnexpectedError(status, "esl_msafile_GuessAlphabet")
-
-    # --- Methods ------------------------------------------------------------
-
-    cpdef void close(self):
-        """close(self)\n--
-
-        Close the file and free the resources used by the parser.
-
-        """
-        libeasel.msafile.esl_msafile_Close(self._msaf)
-        self._msaf = NULL
 
     cpdef MSA read(self):
         """read(self)\n--
@@ -4002,7 +4370,7 @@ cdef class Randomness:
             if self._rng == NULL:
                 raise AllocationError("ESL_RANDOMNESS", sizeof(ESL_RANDOMNESS))
         else:
-            self._seed(_seed)
+            self.seed(_seed)
 
     def __copy__(self):
         return self.copy()
@@ -4016,7 +4384,7 @@ cdef class Randomness:
         cdef type ty   = type(self)
         cdef str  name = ty.__name__
         cdef str  mod  = ty.__module__
-        return f"{mod}.{name}({self._rng.seed!r}, fast={self.is_fast()!r})"
+        return f"{mod}.{name}({self._rng.seed!r}, fast={self.fast!r})"
 
     def __getstate__(self):
         return self.getstate()
@@ -4028,6 +4396,16 @@ cdef class Randomness:
         assert self._rng != NULL
         return sizeof(ESL_RANDOMNESS) + sizeof(self)
 
+    # --- Properties ---------------------------------------------------------
+
+    @property
+    def fast(self):
+        """`bool`: `True` when the linear congruential generator is in use.
+        """
+        assert self._rng != NULL
+        return self._rng.type == libeasel.random.esl_randomness_type.eslRND_FAST
+
+
     # --- Methods ------------------------------------------------------------
 
     def getstate(self):
@@ -4037,7 +4415,7 @@ cdef class Randomness:
 
         """
         assert self._rng != NULL
-        if self.is_fast():
+        if self.fast:
             return ( True, self._rng.seed, self._rng.x )
         else:
             return ( False, self._rng.seed, self._rng.mti, [self._rng.mt[x] for x in range(624)] )
@@ -4060,11 +4438,6 @@ cdef class Randomness:
             for x in range(624):
                 self._rng.mt[x] = state[3][x]
 
-    cdef int _seed(self, uint32_t n) except 1:
-        status = libeasel.random.esl_randomness_Init(self._rng, n)
-        if status != libeasel.eslOK:
-            raise UnexpectedError(status, "esl_randomness_Init")
-
     cpdef void seed(self, object n=None) except *:
         """seed(n=None)\n--
 
@@ -4076,8 +4449,14 @@ cdef class Randomness:
 
         """
         assert self._rng != NULL
-        cdef uint32_t seed = n if n is not None else 0
-        self._seed(seed)
+
+        cdef int      status
+        cdef uint32_t seed   = n if n is not None else 0
+
+        with nogil:
+            status = libeasel.random.esl_randomness_Init(self._rng, seed)
+        if status != libeasel.eslOK:
+            raise UnexpectedError(status, "esl_randomness_Init")
 
     cpdef Randomness copy(self):
         """copy(self)\n--
@@ -4118,15 +4497,6 @@ cdef class Randomness:
         assert self._rng != NULL
         return libeasel.random.esl_rnd_Gaussian(self._rng, mu, sigma)
 
-    cpdef bint is_fast(self):
-        """is_fast(self)\n--
-
-        Returns whether or not the linear congruential generator is in use.
-
-        """
-        assert self._rng != NULL
-        return self._rng.type == libeasel.random.esl_randomness_type.eslRND_FAST
-
 
 # --- Sequence ---------------------------------------------------------------
 
@@ -4142,9 +4512,9 @@ cdef class Sequence:
     To avoid this, ``pyhmmer`` provides two subclasses of the `Sequence`
     abstract class to maintain the mode contract: `TextSequence` and
     `DigitalSequence`. Functions expecting sequences in digital format, like
-    `pyhmmer.hmmsearch`, can then use Python type system to make sure they
-    receive sequences in the right mode. This allows type checkers such as
-    ``mypy`` to detect potential contract breaches at compile-time.
+    `pyhmmer.hmmer.hmmsearch`, can then use Python type system to make sure
+    they receive sequences in the right mode. This allows type checkers
+    such as ``mypy`` to detect potential contract breaches at compile-time.
 
     """
 
@@ -4186,6 +4556,24 @@ cdef class Sequence:
 
     def __copy__(self):
         return self.copy()
+
+    def __sizeof__(self):
+        assert self._sq != NULL
+        cdef ssize_t i
+        cdef size_t  extra_markup_size = 0
+        for i in range(self._sq.nxr):
+            extra_markup_size += strlen(self._sq.xr_tag[i]) * sizeof(char)
+            extra_markup_size += self._sq.salloc * sizeof(char)
+        return (
+                sizeof(self)
+            +   sizeof(ESL_SQ)
+            +   self._sq.nalloc * sizeof(char)
+            +   self._sq.aalloc * sizeof(char)
+            +   self._sq.dalloc * sizeof(char)
+            +   self._sq.salloc * sizeof(char)
+            +   self._sq.srcalloc * sizeof(char)
+            +   extra_markup_size
+        )
 
     # --- Properties ---------------------------------------------------------
 
@@ -4279,6 +4667,8 @@ cdef class Sequence:
 
         .. versionadded:: 0.4.6
 
+        .. deprecated:: 0.7.2
+
         """
         assert self._sq != NULL
         return None if self._sq.tax_id == -1 else self._sq.tax_id
@@ -4286,6 +4676,14 @@ cdef class Sequence:
     @taxonomy_id.setter
     def taxonomy_id(self, object tax_id):
         assert self._sq != NULL
+        warnings.warn(
+            (
+                "`Sequence.taxonomy_id` is not supported consistently "
+                "in Easel and will be removed in `v0.8.0`"
+            ),
+            category=DeprecationWarning,
+            stacklevel=1
+        )
         if tax_id is None:
             self._sq.tax_id = -1
         elif (<int32_t> tax_id) > 0:
@@ -4476,7 +4874,11 @@ cdef class TextSequence(Sequence):
             self.description = description
         if source is not None:
             self.source = source
-        if taxonomy_id is not None:
+
+        # TODO: Remove `taxonomy_id` attribute in v0.8.0.
+        if taxonomy_id is None:
+            self._sq.tax_id = -1
+        else:
             self.taxonomy_id = taxonomy_id
 
         assert libeasel.sq.esl_sq_IsText(self._sq)
@@ -4521,6 +4923,7 @@ cdef class TextSequence(Sequence):
 
         if status == libeasel.eslOK:
             assert libeasel.sq.esl_sq_IsDigital(new._sq)
+            new.taxonomy_id = self.taxonomy_id
             return new
         elif status == libeasel.eslEINVAL:
             raise ValueError(f"Cannot digitize sequence with alphabet {alphabet}: invalid chars in sequence")
@@ -4569,7 +4972,7 @@ cdef class TextSequence(Sequence):
                 inplace and return `None`.
 
         Raises:
-            UserWarning: When the sequence contains unknown characters.
+            `UserWarning`: When the sequence contains unknown characters.
 
         Example:
             >>> seq = TextSequence(sequence="ATGC")
@@ -4640,10 +5043,15 @@ cdef class DigitalSequence(Sequence):
 
         Create a new digital-mode sequence with the given attributes.
 
+        Raises:
+            `ValueError`: When ``sequence`` contains digits outside the
+                alphabet symbol range.
+
         .. versionadded:: 0.1.4
 
         """
         cdef int     status
+        cdef int64_t i
         cdef int64_t n
 
         # create an empty digital sequence
@@ -4659,8 +5067,12 @@ cdef class DigitalSequence(Sequence):
         if sequence is not None:
             # we can release the GIL while copying memory
             with nogil:
-                # grow the sequence buffer so it can hold `n` residues
                 n = sequence.shape[0]
+                # check the sequence encoding is compatible with the alphabet
+                for i in range(n):
+                    if not libeasel.alphabet.esl_abc_XIsValid(alphabet._abc, sequence[i]):
+                        raise ValueError(f"Invalid alphabet character in digital sequence: {sequence[i]}")
+                # grow the sequence buffer so it can hold `n` residues
                 status = libeasel.sq.esl_sq_GrowTo(self._sq, n)
                 if status != libeasel.eslOK:
                     raise UnexpectedError(status, "esl_sq_GrowTo")
@@ -4680,7 +5092,11 @@ cdef class DigitalSequence(Sequence):
             self.description = description
         if source is not None:
             self.source = source
-        if taxonomy_id is not None:
+
+        # TODO: Remove `taxonomy_id` attribute in v0.8.0.
+        if taxonomy_id is None:
+            self._sq.tax_id = -1
+        else:
             self.taxonomy_id = taxonomy_id
 
         assert libeasel.sq.esl_sq_IsDigital(self._sq)
@@ -4760,6 +5176,7 @@ cdef class DigitalSequence(Sequence):
 
         with nogil:
             new._sq = libeasel.sq.esl_sq_Create()
+
             if new._sq == NULL:
                 raise AllocationError("ESL_SQ", sizeof(ESL_SQ))
 
@@ -4767,8 +5184,87 @@ cdef class DigitalSequence(Sequence):
             if status != libeasel.eslOK:
                 raise UnexpectedError(status, "esl_sq_Copy")
 
+            new._sq.tax_id = self._sq.tax_id
+
         assert libeasel.sq.esl_sq_IsText(new._sq)
         return new
+
+    cpdef DigitalSequence translate(self, GeneticCode genetic_code = GeneticCode()):
+        """translate(self, genetic_code=GeneticCode())\n--
+
+        Translate the sequence using the given genetic code.
+
+        Arguments:
+            genetic_code (`pyhmmer.easel.GeneticCode`): The genetic code to
+                use for translating the sequence. If none provided, the
+                default uses the standard translation table (1) and expects
+                DNA sequences.
+
+        Returns:
+            `pyhmmer.easel.DigitalSequence`: The translation of the
+            input sequence, in digital mode.
+
+        Raises:
+            `pyhmmer.errors.AlphabetMismatch`: When the ``genetic_code``
+                expects a different nucleotide alphabet than the one
+                currently in use to encode the sequence.
+            `ValueError`: When ``sequence`` could not be translated
+                properly, because of a codon could not be recognized, or
+                because the sequence has an invalid length.
+
+        Note:
+            The translation of a DNA/RNA codon supports ambiguous codons.
+            If the amino acid is unambiguous, despite codon ambiguity,
+            the correct amino acid is still determined: ``GGR`` translates
+            as ``Gly``, ``UUY`` as ``Phe``, etc. If there is no single
+            unambiguous amino acid translation, the codon is translated
+            as ``X``. Ambiguous amino acids (such as ``J`` or ``B``) are
+            never produced.
+
+        .. versionadded:: 0.7.2
+
+        """
+        assert self._sq != NULL
+        assert self.alphabet is not None
+
+        cdef DigitalSequence protein
+        cdef int64_t         ntlen   = len(self)
+        cdef int64_t         aalen   = ntlen // 3
+
+        # check sequence can be translated
+        if not self.alphabet._eq(genetic_code.nucleotide_alphabet):
+            raise AlphabetMismatch(genetic_code.nucleotide_alphabet, self.alphabet)
+        if ntlen % 3 != 0:
+            raise ValueError(f"Incomplete sequence of length {len(self)!r}")
+
+        # create copy with metadata
+        protein = DigitalSequence(
+            genetic_code.amino_alphabet,
+            name=self.name,
+            description=self.description,
+            accession=self.accession,
+            source=self.source,
+            taxonomy_id=self.taxonomy_id
+        )
+
+        # allocate output buffer
+        status = libeasel.sq.esl_sq_GrowTo(protein._sq, aalen)
+        if status == libeasel.eslEMEM:
+            raise AllocationError("ESL_DSQ", sizeof(ESL_DSQ), aalen + 2)
+        elif status != libeasel.eslOK:
+            raise UnexpectedError(status, "esl_sq_Grow")
+
+        # translate & rename sequence
+        with nogil:
+            genetic_code._translate(&self._sq.dsq[1], ntlen, &protein._sq.dsq[1], aalen)
+            protein._sq.dsq[0] = protein._sq.dsq[aalen+1] = libeasel.eslDSQ_SENTINEL
+
+        # record sequence coordinates
+        protein._sq.start = 1
+        protein._sq.C = 0
+        protein._sq.end = protein._sq.W = protein._sq.L = protein._sq.n = aalen
+
+        return protein
 
     cpdef DigitalSequence reverse_complement(self, bint inplace=False):
         """reverse_complement(self, inplace=False)\n--
@@ -4783,8 +5279,8 @@ cdef class DigitalSequence(Sequence):
                 inplace and return `None`.
 
         Raises:
-            ValueError: When the alphabet of the `DigitalSequence` does
-            not have a complement mapping set (e.g., `Alphabet.amino`).
+            `ValueError`: When the alphabet of the `DigitalSequence` does
+                not have a complement mapping set (e.g., `Alphabet.amino`).
 
         Caution:
             The copy made when ``inplace`` is `False` is an exact copy, so
@@ -4815,6 +5311,666 @@ cdef class DigitalSequence(Sequence):
         return None if inplace else rc
 
 
+# --- Sequence Block ---------------------------------------------------------
+
+cdef class SequenceBlock:
+    """An abstract container for storing `Sequence` objects.
+
+    To pass the target sequences efficiently in `Pipeline.search_hmm`,
+    an array is allocated so that the inner loop can iterate over the
+    target sequences without having to acquire the GIL for each new
+    sequence (this gave a huge performance boost in v0.4.5). However,
+    there was no way to reuse this between different queries; some memory
+    recycling was done, but the target sequences had to be indexed for
+    every query. This class allows synchronizing a Python `list` of
+    `Sequence` objects with an internal C-contiguous buffer of pointers
+    to ``ESL_SQ`` structs that can be used in the HMMER search loop.
+
+    .. versionadded:: 0.7.0
+
+    """
+
+    # NOTE(@althonos): This implementation of a sequence block doesn't
+    #                  actually use an `ESL_SQ_BLOCK` because `ESL_SQ_BLOCK`
+    #                  uses a contiguous array to store sequence data, which
+    #                  is unpractical for `Sequence` objects that may be
+    #                  held from elsewhere with reference counting. An array
+    #                  of pointers is easier to work with in that particular
+    #                  case.
+
+    # --- Magic methods ------------------------------------------------------
+
+    def __cinit__(self):
+        self._refs = NULL
+        self._length = 0
+        self._capacity = 0
+        self._storage = []
+        self._largest = -1
+        self._owner = None
+
+    def __init__(self):
+        raise TypeError("Can't instantiate abstract class 'SequenceBlock'")
+
+    def __dealloc__(self):
+        free(self._refs)
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, object index):
+        if isinstance(index, slice):
+            return type(self)(self._storage[index])
+        else:
+            return self._storage[index]
+
+    def __delitem__(self, object index):
+        cdef size_t   i
+        cdef Sequence sequence
+
+        self._on_modification()
+
+        if isinstance(index, slice):
+            del self._storage[index]
+            self._length = len(self._storage)
+            self._allocate(self._length)
+            for i, sequence in enumerate(self._storage):
+                self._refs[i] = sequence._sq
+        else:
+            self.pop(index)
+
+    def __reduce__(self):
+        return type(self), (), None, iter(self)
+
+    def __copy__(self):
+        return self.copy()
+
+    def __eq__(self, object other):
+        cdef size_t         i
+        cdef SequenceBlock  other_
+        cdef const ESL_SQ** r1
+        cdef const ESL_SQ** r2
+        cdef bint           equal  = True
+
+        if not isinstance(other, SequenceBlock):
+            return NotImplemented
+
+        other_ = other
+        if self._length != other_._length:
+            return False
+
+        with nogil:
+            for i in range(self._length):
+                status = libeasel.sq.esl_sq_Compare(self._refs[i], other_._refs[i])
+                if status == libeasel.eslOK:
+                    continue
+                elif status == libeasel.eslFAIL:
+                    equal = False
+                    break
+                else:
+                    raise UnexpectedError(status, "esl_sq_Compare")
+
+        return equal
+
+    def __sizeof__(self):
+        return sizeof(self) + self._capacity * sizeof(ESL_SQ*)
+
+    # --- C methods ----------------------------------------------------------
+
+    cdef void _allocate(self, size_t n) except *:
+        """_allocate(self, n, /)\n--
+
+        Allocate enough storage for at least ``n`` items.
+
+        """
+        cdef size_t i
+        cdef size_t capacity = new_capacity(n, self._length)
+        with nogil:
+            self._refs = <ESL_SQ**> realloc(self._refs, capacity * sizeof(ESL_SQ*))
+        if self._refs == NULL:
+            self._capacity = 0
+            raise AllocationError("ESL_SQ*", sizeof(ESL_SQ*), capacity)
+        else:
+            self._capacity = capacity
+        # for i in range(self._length, self._capacity):
+        #     self._refs[i] = NULL
+
+    cdef void _on_modification(self) except *:
+        self._largest = -1 # invalidate cache
+
+    # --- Python methods -----------------------------------------------------
+
+    cdef void _append(self, Sequence sequence) except *:
+        if self._length == self._capacity:
+            self._allocate(self._length + 1)
+        self._storage.append(sequence)
+        self._refs[self._length] = sequence._sq
+        self._length += 1
+        self._on_modification()
+
+    cpdef void clear(self) except *:
+        """clear(self)\n--
+
+        Remove all sequences from the block.
+
+        """
+        cdef size_t i
+        self._storage.clear()
+        self._length = 0
+        self._on_modification()
+
+    cpdef void extend(self, object iterable) except *:
+        """extend(self, iterable, /)\n--
+
+        Extend block by appending sequences from the iterable.
+
+        """
+        cdef size_t hint = operator.length_hint(iterable)
+        if self._length + hint > self._capacity:
+            self._allocate(self._length + hint)
+        self._on_modification()
+        for sequence in iterable:
+            self.append(sequence)
+
+    cdef Sequence _pop(self, ssize_t index=-1):
+        cdef ssize_t index_ = index
+        if self._length == 0:
+            raise IndexError("pop from empty block")
+        if index_ < 0:
+            index_ += self._length
+        if index_ < 0 or <size_t> index_ >= self._length:
+            raise IndexError(index)
+
+        # remove item from storage
+        item = self._storage.pop(index_)
+
+        # update pointers in the reference array
+        self._length -= 1
+        if <size_t> index_ < self._length:
+            memmove(&self._refs[index_], &self._refs[index_ + 1], (self._length - index_)*sizeof(ESL_SQ*))
+
+        self._on_modification()
+        return item
+
+    cdef void _insert(self, ssize_t index, Sequence sequence) except *:
+        if index < 0:
+            index = 0
+        elif <size_t> index > self._length:
+            index = self._length
+
+        if self._length == self._capacity - 1:
+            self._allocate(self._capacity + 1)
+
+        if <size_t> index != self._length:
+            memmove(&self._refs[index + 1], &self._refs[index], (self._length - index)*sizeof(ESL_SQ*))
+
+        self._storage.insert(index, sequence)
+        self._refs[index] = sequence._sq
+        self._length += 1
+        self._on_modification()
+
+    cdef size_t _index(self, Sequence sequence, ssize_t start=0, ssize_t stop=sys.maxsize) except *:
+        cdef size_t i
+        cdef size_t start_
+        cdef size_t stop_
+        cdef int    status
+
+        # wrap once is negative indices are used
+        if start < 0:
+            start += <ssize_t> self._length
+        if stop < 0:
+            stop += <ssize_t> self._length
+
+        # wrap a second time if indices are still negative or out of bounds
+        stop_ = min(stop, <ssize_t> self._length)
+        start_ = max(start, 0)
+
+        # scan to locate the sequence
+        with nogil:
+            for i in range(start_, stop_):
+                status = libeasel.sq.esl_sq_Compare(sequence._sq, self._refs[i])
+                if status == libeasel.eslOK:
+                    break
+                elif status != libeasel.eslFAIL:
+                    raise UnexpectedError(status, "esl_sq_Compare")
+            else:
+                raise ValueError(f"sequence {sequence.name!r} not in block")
+
+        return i
+
+    cdef void _remove(self, Sequence sequence) except *:
+        self.pop(self._index(sequence))
+
+    cpdef Sequence largest(self):
+        """largest(self)\n--
+
+        Return the largest sequence in the block.
+
+        """
+        cdef size_t i
+
+        if self._length == 0:
+            raise ValueError("block is empty")
+        if self._largest == -1:
+            self._largest = 0
+            for i in range(1, self._length):
+                if self._refs[i].L > self._refs[self._largest].L:
+                    self._largest = i
+
+        return self._storage[self._largest]
+
+    cpdef SequenceBlock copy(self):
+        """copy(self)\n--
+
+        Return a copy of the sequence block.
+
+        Note:
+            The sequence internally refered to by this collection are not
+            copied. Use `copy.deepcopy` if you also want to duplicate the
+            internal storage of each sequence.
+
+        """
+        return self[:]
+
+
+cdef class TextSequenceBlock(SequenceBlock):
+    """A container for storing `TextSequence` objects.
+
+    .. versionadded:: 0.7.0
+
+    """
+
+    # --- Magic methods ------------------------------------------------------
+
+    def __init__(self, object iterable = ()):
+        self.clear()
+        self.extend(iterable)
+
+    def __repr__(self):
+        cdef str ty = type(self).__name__
+        return f"{ty}({self._storage!r})"
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, object index):
+        if isinstance(index, slice):
+            return type(self)(self._storage[index])
+        else:
+            return self._storage[index]
+
+    def __setitem__(self, object index, object sequences):
+        cdef size_t       i
+        cdef TextSequence sequence
+
+        if isinstance(index, slice):
+            self._storage[index] = sequences
+            self._length = len(self._storage)
+            self._allocate(self._length)
+            for i, sequence in enumerate(self._storage):
+                self._refs[i] = sequence._sq
+        else:
+            sequence = sequences
+            self._storage[index] = sequence
+            self._refs[index] = sequence._sq
+
+    def __contains__(self, object sequence):
+        if isinstance(sequence, TextSequence):
+            try:
+                return self._index(sequence) >= 0
+            except ValueError:
+                return False
+        return False
+
+    # --- Python methods -----------------------------------------------------
+
+    cpdef void append(self, TextSequence sequence) except *:
+        """append(self, sequence)\n--
+
+        Append ``sequence`` at the end of the block.
+
+        """
+        self._append(sequence)
+
+    cpdef TextSequence pop(self, ssize_t index=-1):
+        """pop(self, index=-1)\n--
+
+        Remove and return a sequence from the block (the last one by default).
+
+        """
+        return self._pop(index)
+
+    cpdef void insert(self, ssize_t index, TextSequence sequence) except *:
+        """insert(self, index, sequence)\n--
+
+        Insert a new sequence in the block before ``index``.
+
+        """
+        self._insert(index, sequence)
+
+    cpdef size_t index(self, TextSequence sequence, ssize_t start=0, ssize_t stop=sys.maxsize) except *:
+        """index(self, sequence, start=0, stop=sys.maxsize)\n--
+
+        Return the index of the first occurence of ``sequence``.
+
+        Raises:
+            `ValueError`: When the block does not contain ``sequence``.
+
+        """
+        return self._index(sequence, start, stop)
+
+    cpdef void remove(self, TextSequence sequence) except *:
+        """remove(self, sequence)\n--
+
+        Remove the first occurence of the given sequence.
+
+        """
+        self._remove(sequence)
+
+    cpdef DigitalSequenceBlock digitize(self, Alphabet alphabet):
+        """digitize(self, alphabet)\n--
+
+        Create a block containing sequences from this block in digital mode.
+
+        """
+        cdef size_t               i
+        cdef list                 seqs  = [ DigitalSequence(alphabet) for _ in range(self._length) ]
+        cdef DigitalSequenceBlock block = DigitalSequenceBlock(alphabet, seqs)
+
+        with nogil:
+            for i in range(self._length):
+                libeasel.sq.esl_sq_Copy(self._refs[i], block._refs[i])
+                block._refs[i].tax_id = self._refs[i].tax_id
+
+        return block
+
+    cpdef TextSequence largest(self):
+        """largest(self)\n--
+
+        Return the largest sequence in the block.
+
+        """
+        return SequenceBlock.largest(self)
+
+    cpdef TextSequenceBlock copy(self):
+        """copy(self)\n--
+
+        Return a copy of the text sequence block.
+
+        Note:
+            The sequence internally refered to by this collection are not
+            copied. Use `copy.deepcopy` is you also want to duplicate the
+            internal storage of each sequence.
+
+        """
+        cdef TextSequenceBlock new = TextSequenceBlock.__new__(TextSequenceBlock)
+        new._storage = self._storage.copy()
+        new._length = self._length
+        new._largest = self._largest
+        new._owner = self._owner
+        new._allocate(self._length)
+        memcpy(new._refs, self._refs, self._length * sizeof(ESL_SQ*))
+        return new
+
+
+cdef class DigitalSequenceBlock(SequenceBlock):
+    """A container for storing `DigitalSequence` objects.
+
+    Attributes:
+        alphabet (`Alphabet`, *readonly*): The biological alphabet shared by
+            all sequences in the collection.
+
+    .. versionadded:: 0.7.0
+
+    """
+
+    # --- Magic methods ------------------------------------------------------
+
+    def __cinit__(self, Alphabet alphabet, *args, **kwargs):
+        self.alphabet = alphabet
+
+    def __init__(self, Alphabet alphabet not None, object iterable = ()):
+        """Create a new digital sequence block with the given alphabet.
+
+        Arguments:
+            alphabet (`~pyhmmer.easel.Alphabet`): The alphabet to use for all
+                the sequences in the block.
+            iterable (iterable of `~pyhmmer.easel.DigitalSequence`): An initial
+                collection of digital sequences to add to the block.
+
+        Raises:
+            `~pyhmmer.easel.AlphabetMismatch`: When the alphabet of one of the
+                sequences does not match ``alphabet``.
+
+        """
+        self.clear()
+        self.extend(iterable)
+
+    def __repr__(self):
+        cdef str ty = type(self).__name__
+        return f"{ty}({self.alphabet!r}, {self._storage!r})"
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, object index):
+        if isinstance(index, slice):
+            return type(self)(self.alphabet, self._storage[index])
+        else:
+            return self._storage[index]
+
+    def __reduce__(self):
+        return type(self), (self.alphabet,), None, iter(self)
+
+    def __setitem__(self, object index, object sequences):
+        cdef size_t          i
+        cdef DigitalSequence sequence
+
+        if isinstance(index, slice):
+            self._storage[index] = sequences
+            self._length = len(self._storage)
+            self._allocate(self._length)
+            for i, sequence in enumerate(self._storage):
+                if sequence.alphabet != self.alphabet:
+                    raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+                self._refs[i] = sequence._sq
+        else:
+            sequence = sequences
+            if sequence.alphabet != self.alphabet:
+                raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+            self._storage[index] = sequence
+            self._refs[index] = sequence._sq
+
+    def __contains__(self, object sequence):
+        if isinstance(sequence, DigitalSequence):
+            try:
+                return self._index(sequence) >= 0
+            except ValueError:
+                return False
+        return False
+
+    # --- Python methods -----------------------------------------------------
+
+    cpdef void append(self, DigitalSequence sequence) except *:
+        """append(self, sequence)\n--
+
+        Append ``sequence`` at the end of the block.
+
+        """
+        if sequence.alphabet != self.alphabet:
+            raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+        self._append(sequence)
+
+    cpdef DigitalSequence pop(self, ssize_t index=-1):
+        """pop(self, index=-1)\n--
+
+        Remove and return a sequence from the block (the last one by default).
+
+        """
+        return self._pop(index)
+
+    cpdef void insert(self, ssize_t index, DigitalSequence sequence) except *:
+        """insert(self, index, sequence)\n--
+
+        Insert a new sequence in the block before ``index``.
+
+        """
+        if sequence.alphabet != self.alphabet:
+            raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+        self._insert(index, sequence)
+
+    cpdef size_t index(self, DigitalSequence sequence, ssize_t start=0, ssize_t stop=sys.maxsize) except *:
+        """index(self, sequence, start=0, stop=sys.maxsize)\n--
+
+        Return the index of the first occurence of ``sequence``.
+
+        Raises:
+            `ValueError`: When the block does not contain ``sequence``.
+
+        """
+        if sequence.alphabet != self.alphabet:
+            raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+        return self._index(sequence, start, stop)
+
+    cpdef void remove(self, DigitalSequence sequence) except *:
+        """remove(self, sequence)\n--
+
+        Remove the first occurence of the given sequence.
+
+        """
+        if sequence.alphabet != self.alphabet:
+            raise AlphabetMismatch(self.alphabet, sequence.alphabet)
+        self._remove(sequence)
+
+    cpdef TextSequenceBlock textize(self):
+        """textize(self, alphabet)\n--
+
+        Create a block containing sequences from this block in text mode.
+
+        """
+        cdef size_t            i
+        cdef list              seqs  = [ TextSequence() for _ in range(self._length) ]
+        cdef TextSequenceBlock block = TextSequenceBlock(seqs)
+
+        with nogil:
+            for i in range(self._length):
+                libeasel.sq.esl_sq_Copy(self._refs[i], block._refs[i])
+                block._refs[i].tax_id = self._refs[i].tax_id
+
+        return block
+
+    cpdef DigitalSequenceBlock translate(self, GeneticCode genetic_code = GeneticCode()):
+        """translate(self, genetic_code=GeneticCode())\n--
+
+        Translate the sequence block using the given genetic code.
+
+        Arguments:
+            genetic_code (`pyhmmer.easel.GeneticCode`): The genetic code to
+                use for translating the sequence. If none provided, the
+                default uses the standard translation table (1) and expects
+                DNA sequences.
+
+        Returns:
+            `pyhmmer.easel.DigitalSequenceBlock`: The translation of
+            each sequence from the block, in digital mode.
+
+        Raises:
+            `pyhmmer.errors.AlphabetMismatch`: When the ``genetic_code``
+                expects a different nucleotide alphabet than the one
+                currently for the sequences in the block.
+            `ValueError`: When a sequence from the block could not be
+                translated properly, because of a codon could not be
+                recognized, or because the sequence has an invalid length.
+
+        See Also:
+            `pyhmmer.easel.DigitalSequence.translate` for more information
+            on how ambiguous nucleotides are handled.
+
+        """
+        assert self.alphabet is not None
+
+        # cdef int64_t         ntlen   = len(self)
+        # cdef int64_t         aalen   = ntlen // 3
+        # cdef DigitalSequence protein = DigitalSequence(genetic_code.amino_alphabet)
+
+        cdef size_t               i
+        cdef int64_t              aalen
+        cdef int64_t              ntlen
+        cdef int                  status
+        cdef DigitalSequence      protein
+        cdef DigitalSequenceBlock proteins
+
+        # check block can be translated
+        if not self.alphabet._eq(genetic_code.nucleotide_alphabet):
+            raise AlphabetMismatch(genetic_code.nucleotide_alphabet, self.alphabet)
+
+        # pre-allocate protein sequence buffers
+        proteins = DigitalSequenceBlock(genetic_code.amino_alphabet)
+        proteins._allocate(self._length)
+        for i in range(self._length):
+            assert self._refs != NULL
+            assert self._refs[i] != NULL
+            # get length of input and output sequences
+            ntlen = self._refs[i].n
+            if ntlen % 3 != 0:
+                raise ValueError(f"Incomplete sequence of length {ntlen!r} at index {i!r}")
+            aalen = ntlen // 3
+            # create new object
+            protein = DigitalSequence(
+                genetic_code.amino_alphabet,
+                name=self._storage[i].name,
+                description=self._storage[i].description,
+                accession=self._storage[i].accession,
+                source=self._storage[i].source,
+                taxonomy_id=self._storage[i].taxonomy_id
+            )
+
+            proteins._append(protein)
+            # grow the internal sequence buffer
+            status = libeasel.sq.esl_sq_GrowTo(protein._sq, aalen)
+            if status == libeasel.eslEMEM:
+                raise AllocationError("ESL_DSQ", sizeof(ESL_DSQ), aalen + 2)
+            elif status != libeasel.eslOK:
+                raise UnexpectedError(status, "esl_sq_Grow")
+            # record sequence coordinates
+            protein._sq.start = 1
+            protein._sq.C = 0
+            protein._sq.end = protein._sq.W = protein._sq.L = protein._sq.n = aalen
+
+        # translate the sequences
+        with nogil:
+            for i in range(self._length):
+                ntlen = self._refs[i].n
+                aalen = proteins._refs[i].n
+                genetic_code._translate(&self._refs[i].dsq[1], ntlen, &proteins._refs[i].dsq[1], aalen)
+                protein._sq.dsq[0] = protein._sq.dsq[aalen+1] = libeasel.eslDSQ_SENTINEL
+
+        proteins._largest = self._largest
+        return proteins
+
+    cpdef DigitalSequence largest(self):
+        return SequenceBlock.largest(self)
+
+    cpdef DigitalSequenceBlock copy(self):
+        """copy(self)\n--
+
+        Return a copy of the digital sequence block.
+
+        Note:
+            The sequence internally refered to by this collection are not
+            copied. Use `copy.deepcopy` is you also want to duplicate the
+            internal storage of each sequence.
+
+        """
+        cdef DigitalSequenceBlock new = DigitalSequenceBlock.__new__(DigitalSequenceBlock, self.alphabet)
+        new._storage = self._storage.copy()
+        new._length = self._length
+        new._largest = self._largest
+        new._owner = self._owner
+        new._allocate(self._length)
+        memcpy(new._refs, self._refs, self._length * sizeof(ESL_SQ*))
+        return new
+
+
 # --- Sequence File ----------------------------------------------------------
 
 cdef class SequenceFile:
@@ -4831,7 +5987,7 @@ cdef class SequenceFile:
         sequences will be read sequentially, removing the gap characters::
 
             >>> with SequenceFile("tests/data/msa/LuxC.sto") as sf:
-            ...     sequences = list(sf)
+            ...     sequences = sf.read_block()
             >>> print(sequences[0].name[:6], sequences[0].sequence[:30])
             b'Q9KV99' LANQPLEAILGLINEARKSWSSTPELDPYR
             >>> print(sequences[1].name[:6], sequences[1].sequence[:30])
@@ -5129,6 +6285,7 @@ cdef class SequenceFile:
 
     def __cinit__(self):
         self.alphabet = None
+        self.name = None
         self._sqfp = NULL
 
     def __init__(
@@ -5223,6 +6380,7 @@ cdef class SequenceFile:
             status = libeasel.eslOK
         else:
             status = libeasel.sqio.esl_sqfile_Open(fspath, fmt, NULL, &self._sqfp)
+            self.name = os.fsdecode(fspath)
 
         # store a reference to the argument
         self._file = file
@@ -5315,9 +6473,18 @@ cdef class SequenceFile:
             raise ValueError("I/O operation on closed file.")
         return SEQUENCE_FILE_FORMATS_INDEX[self._sqfp.format]
 
-    # --- Utils --------------------------------------------------------------
+    # --- Methods ------------------------------------------------------------
 
-    cdef Alphabet guess_alphabet(self):
+    cpdef void close(self) except *:
+        """close(self)\n--
+
+        Close the file and free the resources used by the parser.
+
+        """
+        libeasel.sqio.esl_sqfile_Close(self._sqfp)
+        self._sqfp = NULL
+
+    cpdef Alphabet guess_alphabet(self):
         """guess_alphabet(self)\n--
 
         Guess the alphabet of an open `SequenceFile`.
@@ -5329,7 +6496,17 @@ cdef class SequenceFile:
         Raises:
             `EOFError`: if the file is empty.
             `OSError`: if a parse error occurred.
-            `ValueError`: if this methods is called after the file was closed.
+            `ValueError`: if this methods is called on a closed file.
+
+        Example:
+            >>> with SequenceFile("tests/data/seqs/bmyD.fna") as sf:
+            ...     sf.guess_alphabet()
+            pyhmmer.easel.Alphabet.dna()
+            >>> with SequenceFile("tests/data/seqs/LuxC.faa") as sf:
+            ...     sf.guess_alphabet()
+            pyhmmer.easel.Alphabet.amino()
+
+        .. versionadded:: 0.6.3
 
         """
         cdef int         ty
@@ -5346,7 +6523,7 @@ cdef class SequenceFile:
             alphabet = Alphabet.__new__(Alphabet)
             alphabet._init_default(ty)
             return alphabet
-        elif status == libeasel.eslENOALPHABET:
+        elif status == libeasel.eslENOALPHABET or status == libeasel.eslEOD:
             return None
         elif status == libeasel.eslENODATA:
             raise EOFError("Sequence file appears to be empty.")
@@ -5356,17 +6533,6 @@ cdef class SequenceFile:
             raise ValueError("Could not parse file: {}".format(msg))
         else:
             raise UnexpectedError(status, "esl_sqfile_GuessAlphabet")
-
-    # --- Methods ------------------------------------------------------------
-
-    cpdef void close(self):
-        """close(self)\n--
-
-        Close the file and free the resources used by the parser.
-
-        """
-        libeasel.sqio.esl_sqfile_Close(self._sqfp)
-        self._sqfp = NULL
 
     cpdef Sequence read(self, bint skip_info=False, bint skip_sequence=False):
         """read(self, skip_info=False, skip_sequence=False)\n--
@@ -5397,6 +6563,8 @@ cdef class SequenceFile:
 
         """
         cdef Sequence seq
+        if self._sqfp == NULL:
+            raise ValueError("I/O operation on closed file.")
         if self.alphabet is None:
             seq = TextSequence()
         else:
@@ -5441,28 +6609,25 @@ cdef class SequenceFile:
         """
         assert seq._sq != NULL
 
-        cdef int         (*funcread)(ESL_SQFILE *sqfp, ESL_SQ *sq) except -1
         cdef str         funcname
         cdef int         status
         cdef const char* errbuf
         cdef str         msg
 
-        if not skip_info and not skip_sequence:
-            funcname = "esl_sqio_Read"
-            funcread = libeasel.sqio.esl_sqio_Read
-        elif not skip_info:
-            funcname = "esl_sqio_ReadInfo"
-            funcread = libeasel.sqio.esl_sqio_ReadInfo
-        elif not skip_sequence:
-            funcname = "esl_sqio_ReadSequence"
-            funcread = libeasel.sqio.esl_sqio_ReadSequence
-        else:
-            raise ValueError("Cannot skip reading both sequence and metadata.")
-
         if self._sqfp == NULL:
             raise ValueError("I/O operation on closed file.")
+
+        if not skip_info and not skip_sequence:
+            funcname = "esl_sqio_Read"
+            status = libeasel.sqio.esl_sqio_Read(self._sqfp, seq._sq)
+        elif not skip_info:
+            funcname = "esl_sqio_ReadInfo"
+            status = libeasel.sqio.esl_sqio_ReadInfo(self._sqfp, seq._sq)
+        elif not skip_sequence:
+            funcname = "esl_sqio_ReadSequence"
+            status = libeasel.sqio.esl_sqio_ReadSequence(self._sqfp, seq._sq)
         else:
-            status = funcread(self._sqfp, seq._sq)
+            raise ValueError("Cannot skip reading both sequence and metadata.")
 
         if status == libeasel.eslOK:
             return seq
@@ -5475,6 +6640,108 @@ cdef class SequenceFile:
         else:
             raise UnexpectedError(status, funcname)
 
+    cpdef SequenceBlock read_block(self, object sequences=None, object residues=None):
+        """read_block(self, max_sequences=None, max_residues=None)\n--
+
+        Read several sequences into a sequence block.
+
+        Arguments:
+            sequences (`int`, *optional*): The maximum number of sequences
+                to read before returning a block. Leave as `None` to read all
+                remaining sequences from the file.
+            residues (`int`, *optional*): The number of residues to read
+                before returning the block. Leave as `None` to keep reading
+                sequences without a residue limit.
+
+        Returns:
+            `~pyhmmer.easel.SequenceBlock`: A sequence block object, which may
+            be empty if there are no sequences to read anymore. The concrete
+            type depends on whether the `SequenceFile` was opened in text or
+            digital mode.
+
+        Raises:
+            `ValueError`: When attempting to read a sequence from a closed
+                file, or when the file could not be parsed.
+
+        Example:
+            Read a block of at most 4 sequences from a sequence file::
+
+                >>> with SequenceFile("tests/data/seqs/LuxC.faa") as sf:
+                ...     block = sf.read_block(sequences=4)
+                >>> len(block)
+                4
+
+            Read sequences until the block contains at least 1000 residues:
+
+                >>> with SequenceFile("tests/data/seqs/LuxC.faa") as sf:
+                ...     block = sf.read_block(residues=1000)
+                >>> len(block)
+                3
+                >>> len(block[0]) + len(block[1]) + len(block[2])
+                1444
+
+            Note that the last sequence will not be truncated, so the block
+            will always contain more than ``max_residues`` unless the end of
+            the file was reached.
+
+        .. versionadded:: 0.7.0
+
+        """
+        cdef SequenceBlock block
+        cdef object        iterator
+        cdef size_t        n_residues    = 0
+        cdef size_t        n_sequences   = 0
+        cdef size_t        max_sequences = SIZE_MAX if sequences is None else sequences
+        cdef size_t        max_residues  = SIZE_MAX if residues is None else residues
+
+        if self._sqfp == NULL:
+            raise ValueError("I/O operation on closed file.")
+
+        if self.alphabet is None:
+            block = TextSequenceBlock()
+        else:
+            block = DigitalSequenceBlock(self.alphabet)
+        if sequences is not None:
+            block._allocate(sequences)
+
+        while n_sequences < max_sequences and n_residues < max_residues:
+            sequence = self.read()
+            if sequence is None:
+                break
+            else:
+                n_residues += len(sequence)
+                n_sequences += 1
+                block.append(sequence)
+
+        return block
+
+    cpdef void rewind(self) except *:
+        """rewind(self)\n--
+
+        Rewind the file back to the beginning.
+
+        For sequential formats, this method is supported for both *path*-based
+        and *file object*-based sequence files. For multiple-sequence
+        alignment formats, the underlying `MSAFile` needs to be reopened,
+        so this is only supported for *path*-based files.
+
+        Raises:
+            `io.UnsupportedOperation`: When attempting to rewind a sequence
+                file where the underlying stream is a file-like object that
+                does not support the `~io.IOBase.seek` method.
+
+        """
+        if self._sqfp == NULL:
+            raise ValueError("I/O operation on closed file")
+        status = libeasel.sqio.esl_sqfile_Position(self._sqfp, 0)
+        if status == libeasel.eslEMEM:
+            raise AllocationError("ESL_SQFILE", sizeof(ESL_SQFILE))
+        elif status == libeasel.eslESYS or status == libeasel.eslEINVAL:
+            raise io.UnsupportedOperation("underlying stream is not seekable")
+        elif status == libeasel.eslENOTFOUND:
+            raise io.UnsupportedOperation("failed to re-open file")
+        elif status != libeasel.eslOK:
+            raise UnexpectedError(status, "esl_sqfile_Position")
 
 # --- Sequence/Subsequence Index ---------------------------------------------
 
@@ -5744,8 +7011,3 @@ cdef class SSIWriter:
 
             libeasel.ssi.esl_newssi_Close(self._newssi)
             self._newssi = NULL
-
-
-# --- Module init code -------------------------------------------------------
-
-include "exceptions.pxi"

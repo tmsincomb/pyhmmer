@@ -48,6 +48,34 @@ DigitalSequence
    :special-members: __init__
    :members:
 
+
+Sequence Blocks
+---------------
+
+SequenceBlock
+^^^^^^^^^^^^^
+
+.. autoclass:: pyhmmer.easel.SequenceBlock
+   :members:
+
+TextSequenceBlock
+^^^^^^^^^^^^^^^^^
+
+.. autoclass:: pyhmmer.easel.TextSequenceBlock(SequenceBlock)
+   :special-members: __init__
+   :members:
+
+DigitalSequenceBlock
+^^^^^^^^^^^^^^^^^^^^
+
+.. autoclass:: pyhmmer.easel.DigitalSequenceBlock(SequenceBlock)
+   :special-members: __init__
+   :members:
+
+
+SequenceFile
+------------
+
 SequenceFile
 ^^^^^^^^^^^^
 

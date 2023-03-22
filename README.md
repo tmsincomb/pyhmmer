@@ -1,8 +1,8 @@
-# 🐍🟡♦️🟦 pyHMMER [![Stars](https://img.shields.io/github/stars/althonos/pyhmmer.svg?style=social&maxAge=3600&label=Star)](https://github.com/althonos/pyhmmer/stargazers)
+# 🐍🟡♦️🟦 PyHMMER [![Stars](https://img.shields.io/github/stars/althonos/pyhmmer.svg?style=social&maxAge=3600&label=Star)](https://github.com/althonos/pyhmmer/stargazers)
 
 *[Cython](https://cython.org/) bindings and Python interface to [HMMER3](http://hmmer.org/).*
 
-[![Actions](https://img.shields.io/github/workflow/status/althonos/pyhmmer/Test/master?logo=github&style=flat-square&maxAge=300)](https://github.com/althonos/pyhmmer/actions)
+[![Actions](https://img.shields.io/github/actions/workflow/status/althonos/pyhmmer/test.yml?branch=master&logo=github&style=flat-square&maxAge=300)](https://github.com/althonos/pyhmmer/actions)
 [![Coverage](https://img.shields.io/codecov/c/gh/althonos/pyhmmer?logo=codecov&style=flat-square&maxAge=3600)](https://codecov.io/gh/althonos/pyhmmer/)
 [![PyPI](https://img.shields.io/pypi/v/pyhmmer.svg?logo=pypi&style=flat-square&maxAge=3600)](https://pypi.org/project/pyhmmer)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/pyhmmer?logo=anaconda&style=flat-square&maxAge=3600)](https://anaconda.org/bioconda/pyhmmer)
@@ -23,10 +23,10 @@
 ## 🗺️ Overview
 
 HMMER is a biological sequence analysis tool that uses profile hidden Markov
-models to search for sequence homologs. HMMER3 is maintained by members of the
+models to search for sequence homologs. HMMER3 is developed and maintained by
 the [Eddy/Rivas Laboratory](http://eddylab.org/) at Harvard University.
 
-`pyhmmer` is a Python module, implemented using the [Cython](https://cython.org/)
+`pyhmmer` is a Python package, implemented using the [Cython](https://cython.org/)
 language, that provides bindings to HMMER3. It directly interacts with the
 HMMER internals, which has the following advantages over CLI wrappers
 (like [`hmmer-py`](https://pypi.org/project/hmmer/)):
@@ -100,7 +100,11 @@ $ pydoc pyhmmer.plan7
 
 ## 💡 Example
 
-Use `pyhmmer` to run `hmmsearch`, and obtain an iterable over
+Use `pyhmmer` to run `hmmsearch` to search for Type 2 PKS domains
+([`t2pks.hmm`](https://raw.githubusercontent.com/althonos/pyhmmer/master/pyhmmer/tests/data/hmms/txt/t2pks.hmm))
+inside proteins extracted from the genome of *Anaerococcus provencensis*
+([`938293.PRJEB85.HG003687.faa`](https://raw.githubusercontent.com/althonos/pyhmmer/master/pyhmmer/tests/data/seqs/938293.PRJEB85.HG003687.faa)).
+This will produce an iterable over
 [`TopHits`] that can be used for further sorting/querying in Python.
 Processing happens in parallel using Python threads, and a [`TopHits`]
 object is yielded for every [`HMM`] passed in the input iterable.
@@ -111,11 +115,12 @@ object is yielded for every [`HMM`] passed in the input iterable.
 ```python
 import pyhmmer
 
-with pyhmmer.easel.SequenceFile("tests/data/seqs/938293.PRJEB85.HG003687.faa", digital=True) as seq_file:
+with pyhmmer.easel.SequenceFile("pyhmmer/tests/data/seqs/938293.PRJEB85.HG003687.faa", digital=True) as seq_file:
     sequences = list(seq_file)
 
-with pyhmmer.plan7.HMMFile("tests/data/hmms/txt/t2pks.hmm") as hmm_file:
-    all_hits = list(pyhmmer.hmmsearch(hmm_file, sequences_file, cpus=4))
+with pyhmmer.plan7.HMMFile("pyhmmer/tests/data/hmms/txt/t2pks.hmm") as hmm_file:
+    for hits in pyhmmer.hmmsearch(hmm_file, sequences, cpus=4):
+      print(f"HMM {hits.query_name.decode()} found {len(hits)} hits in the target sequences")
 ```
 
 Have a look at more in-depth examples such as [building a HMM from an alignment](https://pyhmmer.readthedocs.io/en/stable/examples/msa_to_hmm.html),
@@ -143,14 +148,14 @@ Contributions are more than welcome! See [`CONTRIBUTING.md`](https://github.com/
 ## ⏱️ Benchmarks
 
 Benchmarks were run on a [i7-10710U CPU](https://ark.intel.com/content/www/us/en/ark/products/196448/intel-core-i7-10710u-processor-12m-cache-up-to-4-70-ghz.html) running @1.10GHz with 6 physical / 12
-logical cores, using a FASTA file containing 2,100 protein sequences extracted
-from the genome of *Anaerococcus provencensis*
-([`938293.PRJEB85.HG003687.faa`](https://github.com/althonos/pyhmmer/blob/master/tests/data/seqs/938293.PRJEB85.HG003687.faa))
+logical cores, using a FASTA file containing 4,489 protein sequences extracted
+from the genome of *Escherichia coli*
+([`562.PRJEB4685`](https://progenomes.embl.de/genome.cgi))
 and the version 33.1 of the [Pfam](https://pfam.xfam.org/) HMM library containing
-18,259 domains. Commands were run 4 times on a warm SSD. *Plain lines show
+18,259 domains. Commands were run 3 times on a warm SSD. *Plain lines show
 the times for pressed HMMs, and dashed-lines the times for HMMs in text format.*
 
-![Benchmarks](https://raw.github.com/althonos/pyhmmer/master/benches/v0.5.0/plot.svg)
+![Benchmarks](https://raw.github.com/althonos/pyhmmer/master/benches/v0.7.0/plot.svg)
 
 Raw numbers can be found in the [`benches` folder](https://github.com/althonos/pyhmmer/blob/master/benches/).
 They suggest that `phmmer` should be run with the number of *logical* cores,
@@ -159,16 +164,22 @@ A possible explanation for this observation would be that HMMER
 platform-specific code requires too many [SIMD](https://en.wikipedia.org/wiki/SIMD)
 registers per thread to benefit from [simultaneous multi-threading](https://en.wikipedia.org/wiki/Simultaneous_multithreading).
 
-To read more about how pyHMMER achieves better parallelism than HMMER for
+To read more about how PyHMMER achieves better parallelism than HMMER for
 many-to-many searches, have a look at the [Performance page](https://pyhmmer.readthedocs.io/en/stable/performance.html)
 of the documentation.
 
 
 ## 🔍 See Also
 
-If despite of all the advantages listed earlier, you would rather use HMMER through its CLI,
-this package will not be of great help. You should then check the
-[`hmmer-py`](https://github.com/EBI-Metagenomics/hmmer-py) package developed
+Building a HMM from scratch? Then you may be interested in the [`pyfamsa`](https://pypi.org/project/pyfamsa/)
+package, providing bindings to [FAMSA](https://github.com/refresh-bio/FAMSA),
+a very fast multiple sequence aligner. In addition, you may want to trim alignments:
+in that case, consider [`pytrimal`](https://pypi.org/project/pytrimal), which
+wraps [trimAl 2.0](https://github.com/inab/trimal/tree/2.0_RC).
+
+If despite of all the advantages listed earlier, you would rather use HMMER
+through its CLI, this package will not be of great help. You can instead check
+the [`hmmer-py`](https://github.com/EBI-Metagenomics/hmmer-py) package developed
 by [Danilo Horta](https://github.com/horta) at the [EMBL-EBI](https://www.ebi.ac.uk).
 
 
@@ -179,7 +190,7 @@ The HMMER3 and Easel code is available under the
 [BSD 3-clause](https://choosealicense.com/licenses/bsd-3-clause/) license.
 See `vendor/hmmer/LICENSE` and `vendor/easel/LICENSE` for more information.
 
-*This project is in no way not affiliated, sponsored, or otherwise endorsed by
+*This project is in no way affiliated, sponsored, or otherwise endorsed by
 the [original HMMER authors](http://hmmer.org/). It was developed by
 [Martin Larralde](https://github.com/althonos/pyhmmer) during his PhD project
 at the [European Molecular Biology Laboratory](https://www.embl.de/) in

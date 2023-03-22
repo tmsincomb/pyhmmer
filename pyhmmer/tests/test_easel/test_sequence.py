@@ -8,6 +8,7 @@ import tempfile
 import warnings
 
 from pyhmmer import easel
+from pyhmmer.errors import AlphabetMismatch
 
 
 class _TestSequenceBase(abc.ABC):
@@ -137,6 +138,34 @@ class TestDigitalSequence(_TestSequenceBase, unittest.TestCase):
         seq = easel.TextSequence(sequence="MEMLP").digitize(abc)
         self.assertRaises(ValueError, seq.reverse_complement)
         self.assertRaises(ValueError, seq.reverse_complement, inplace=True)
+
+    def test_invalid_characters(self):
+        self.assertRaises(ValueError, easel.DigitalSequence, self.abc, name=b"TEST", sequence=b"test")
+
+    def test_translate(self):
+        gencode = easel.GeneticCode()
+        seq = easel.TextSequence(sequence="ATGCTGCCCGGTTTGGCACTGCTCCTGCTGGCCGCC").digitize(gencode.nucleotide_alphabet)
+        prot = seq.translate(gencode).textize()
+        self.assertEqual(prot.sequence, "MLPGLALLLLAA")
+
+    def test_translate_copy_metadata(self):
+        gencode = easel.GeneticCode()
+        textseq = easel.TextSequence(sequence="ATGCTGCCCGGT", name=b"seq", source=b"source")
+        seq = textseq.digitize(gencode.nucleotide_alphabet)
+        prot = seq.translate(gencode).textize()
+        self.assertEqual(prot.name, textseq.name)      
+        self.assertEqual(prot.source, textseq.source)      
+
+    def test_translate_empty(self):
+        gencode = easel.GeneticCode()
+        seq = easel.DigitalSequence(gencode.nucleotide_alphabet)
+        prot = seq.translate(gencode).textize()
+        self.assertEqual(prot.sequence, "")
+
+    def test_translate_alphabet_mismatch(self):
+        gencode = easel.GeneticCode()
+        with self.assertRaises(AlphabetMismatch):
+            prot = easel.DigitalSequence(gencode.amino_alphabet).translate(gencode)
 
 
 class TestTextSequence(_TestSequenceBase, unittest.TestCase):

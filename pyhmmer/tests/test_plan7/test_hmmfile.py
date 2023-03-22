@@ -9,7 +9,7 @@ import pkg_resources
 import pyhmmer
 from pyhmmer.errors import EaselError
 from pyhmmer.easel import SequenceFile
-from pyhmmer.plan7 import HMMFile, Pipeline
+from pyhmmer.plan7 import HMMFile, HMMPressedFile, Pipeline
 
 
 # --- Mixins -------------------------------------------------------------------
@@ -39,7 +39,7 @@ class _TestHMMFile:
             self.assertRaises(EOFError, self.open_hmm, empty.name)
 
     def test_read_hmmpressed(self):
-        path = os.path.join(self.hmms_folder, "db", "{}.hmm.h3m".format(self.ID))
+        path = os.path.join(self.hmms_folder, "db", "{}.hmm".format(self.ID))
         with self.open_hmm(path) as f:
             self.check_hmmfile(f)
 
@@ -66,11 +66,19 @@ class _TestHMMFileobj:
             buffer = io.BytesIO(f.read())
         return HMMFile(buffer)
 
+    def test_name(self):
+        path = os.path.join(self.hmms_folder, "db", "{}.hmm".format(self.ID))
+        with self.open_hmm(path) as f:
+            self.assertIs(f.name, None)
+
 
 class _TestHMMPath:
 
     def open_hmm(self, path):
         return HMMFile(path)
+
+    def open_pressed(self, path):
+        return HMMPressedFile(path)
 
     def test_filenotfound(self):
         self.assertRaises(FileNotFoundError, HMMFile, "path/to/missing/file")
@@ -79,6 +87,30 @@ class _TestHMMPath:
         path = os.path.join(self.hmms_folder, "db", "{}.hmm".format(self.ID))
         with self.open_hmm(path) as f:
             self.check_hmmfile(f.optimized_profiles())
+
+    def test_rewind(self):
+        path = os.path.join(self.hmms_folder, "txt", "{}.hmm".format(self.ID))
+        with self.open_hmm(path) as f:
+            hmm1 = f.read()
+            f.rewind()
+            hmm2 = f.read()
+            self.assertIsNot(hmm1, hmm2)
+            self.assertEqual(hmm1.name, hmm2.name)
+
+    def test_rewind_optimized_profiles(self):
+        path = os.path.join(self.hmms_folder, "db", "{}.hmm".format(self.ID))
+        with self.open_pressed(path) as f:
+            om1 = f.read()
+            f.rewind()
+            om2 = f.read()
+            self.assertIsNot(om1, om2)
+            self.assertEqual(om1.name, om2.name)
+
+    def test_name(self):
+        path = os.path.join(self.hmms_folder, "db", "{}.hmm".format(self.ID))
+        with self.open_hmm(path) as f:
+            self.assertEqual(f.name, path)
+            self.assertEqual(f.optimized_profiles().name, path)
 
 
 class _TestThioesterase(_TestHMMFile):

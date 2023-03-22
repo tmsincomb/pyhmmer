@@ -1,6 +1,7 @@
 import io
 import itertools
 import os
+import pickle
 import shutil
 import unittest
 import tempfile
@@ -74,22 +75,27 @@ class TestTopHits(unittest.TestCase):
             self.assertDomainEqual(d1, d2)
 
     def assertHitsEqual(self, hits1, hits2):
+        self.assertEqual(hits1.query_name, hits2.query_name)
+        self.assertEqual(hits1.query_accession, hits2.query_accession)
         self.assertEqual(len(hits1), len(hits2))
         for h1, h2 in zip(hits1, hits2):
             self.assertHitEqual(h1, h2)
 
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         hmm_path = pkg_resources.resource_filename("pyhmmer.tests", "data/hmms/txt/PF02826.hmm")
         seqs_path = pkg_resources.resource_filename("pyhmmer.tests", "data/seqs/938293.PRJEB85.HG003687.faa")
 
         with HMMFile(hmm_path) as hmm_file:
-            self.hmm = next(hmm_file)
-        with SequenceFile(seqs_path, digital=True, alphabet=self.hmm.alphabet) as seqs_file:
-            self.seqs = list(seqs_file)
+            cls.hmm = hmm_file.read()
+        with SequenceFile(seqs_path, digital=True, alphabet=cls.hmm.alphabet) as seqs_file:
+            cls.seqs = seqs_file.read_block()
 
-        self.pipeline = Pipeline(alphabet=self.hmm.alphabet)
-        self.hits = self.pipeline.search_hmm(self.hmm, self.seqs)
-        self.pipeline.clear()
+        cls.pipeline = Pipeline(alphabet=cls.hmm.alphabet)
+        cls._hits = cls.pipeline.search_hmm(cls.hmm, cls.seqs)
+    
+    def setUp(self):
+        self.hits = self._hits.copy()
 
     def test_bool(self):
         self.assertFalse(pyhmmer.plan7.TopHits())
@@ -125,7 +131,7 @@ class TestTopHits(unittest.TestCase):
     def test_searched_nodes(self):
         empty = TopHits()
         self.assertEqual(empty.searched_nodes, 0)
-        self.assertEqual(self.hits.searched_nodes, 682583)
+        self.assertEqual(self.hits.searched_nodes, self.hmm.M)
 
     def test_searched_residues(self):
         empty = TopHits()
@@ -161,9 +167,10 @@ class TestTopHits(unittest.TestCase):
         self.assertHitsEqual(merged, self.hits)
 
     def test_merge_pipeline(self):
-        hits1 = self.pipeline.search_hmm(self.hmm, self.seqs[:1000])
-        hits2 = self.pipeline.search_hmm(self.hmm, self.seqs[1000:2000])
-        hits3 = self.pipeline.search_hmm(self.hmm, self.seqs[2000:])
+        pipeline = Pipeline(alphabet=self.hmm.alphabet)
+        hits1 = pipeline.search_hmm(self.hmm, self.seqs[:1000])
+        hits2 = pipeline.search_hmm(self.hmm, self.seqs[1000:2000])
+        hits3 = pipeline.search_hmm(self.hmm, self.seqs[2000:])
 
         self.assertEqual(hits1.Z, 1000)
         self.assertEqual(hits2.Z, 1000)
@@ -226,14 +233,14 @@ class TestTopHits(unittest.TestCase):
 
     def test_threshold(self):
         # after thresholding, one of the hits will not be included.
-        self.assertEqual(self.hits.hits_included, 15)
-        self.assertEqual(self.hits.hits_reported, 22)
+        self.assertEqual(len(self.hits.included), 15)
+        self.assertEqual(len(self.hits.reported), 22)
 
     def test_to_msa(self):
         msa = self.hits.to_msa(self.hmm.alphabet)
         self.assertIsInstance(msa, TextMSA)
         unique_names = { seq.name.split(b"/")[0] for seq in msa.sequences }
-        self.assertEqual(len(unique_names), self.hits.hits_included)
+        self.assertEqual(len(unique_names), len(self.hits.included))
 
         msa_d = self.hits.to_msa(
             self.hmm.alphabet,
@@ -242,3 +249,105 @@ class TestTopHits(unittest.TestCase):
             all_consensus_cols=True
         )
         self.assertIsInstance(msa_d, DigitalMSA)
+
+    def test_pickle(self):
+        pickled = pickle.loads(pickle.dumps(self.hits))
+        self.assertHitsEqual(pickled, self.hits)
+
+    def test_query_name(self):
+        self.assertEqual(self.hits.query_name, self.hmm.name)
+
+    def test_query_accession(self):
+        self.assertEqual(self.hits.query_accession, self.hmm.accession)
+
+    def test_write_target(self):
+        buffer = io.BytesIO()
+        self.hits.write(buffer, format="targets")
+        lines = buffer.getvalue().decode().splitlines()
+
+        expected = pkg_resources.resource_string("pyhmmer.tests", "data/tables/PF02826.tbl").decode().splitlines()
+        while expected[-1].startswith("#"):
+            expected.pop()
+
+        self.assertMultiLineEqual("\n".join(lines), "\n".join(expected))
+
+    def test_write_domains(self):
+        buffer = io.BytesIO()
+        self.hits.write(buffer, format="domains")
+        lines = buffer.getvalue().decode().splitlines()
+
+        expected = pkg_resources.resource_string("pyhmmer.tests", "data/tables/PF02826.domtbl").decode().splitlines()
+        while expected[-1].startswith("#"):
+            expected.pop()
+
+        self.assertMultiLineEqual("\n".join(lines), "\n".join(expected))
+
+    def test_manual_report(self):
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].reported = False
+        self.assertEqual(len(self.hits.reported), 21)
+        self.assertFalse(self.hits[0].reported)
+        
+        self.hits[0].reported = True
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].reported)
+
+    def test_manual_inclusion(self):
+        self.assertEqual(len(self.hits.included), 15)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].included = False
+        self.assertEqual(len(self.hits.included), 14)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertFalse(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].included = True
+        self.assertEqual(len(self.hits.included), 15)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+
+    def test_manual_drop(self):
+        self.assertEqual(len(self.hits.included), 15)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].dropped = True
+        self.assertEqual(len(self.hits.included), 14)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].dropped)
+        self.assertFalse(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].dropped = False
+        self.assertEqual(len(self.hits.included), 14)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertFalse(self.hits[0].dropped)
+        self.assertFalse(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+
+    def test_manual_duplicate(self):
+        self.assertEqual(len(self.hits.included), 15)
+        self.assertEqual(len(self.hits.reported), 22)
+        self.assertTrue(self.hits[0].included)
+        self.assertTrue(self.hits[0].reported)
+        
+        self.hits[0].duplicate = True
+        self.assertEqual(len(self.hits.included), 14)
+        self.assertEqual(len(self.hits.reported), 21)
+        self.assertFalse(self.hits[0].included)
+        self.assertFalse(self.hits[0].reported)
+        self.assertTrue(self.hits[0].duplicate)
+        
+        self.hits[0].duplicate = False
+        self.assertEqual(len(self.hits.included), 14)
+        self.assertEqual(len(self.hits.reported), 21)
+        self.assertFalse(self.hits[0].included)
+        self.assertFalse(self.hits[0].reported)
+        self.assertFalse(self.hits[0].duplicate)

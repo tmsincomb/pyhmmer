@@ -3,17 +3,19 @@
 
 import collections
 import configparser
+import functools
 import glob
+import multiprocessing.pool
 import os
 import platform
 import re
 import sys
 import subprocess
-from unittest import mock
+from pprint import pprint
 
-import setuptools
+import setuptools # always import setuptools first
 from distutils.command.clean import clean as _clean
-from distutils.errors import CompileError
+from distutils.errors import CompileError, LinkError
 from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.build_clib import build_clib as _build_clib
 from setuptools.command.sdist import sdist as _sdist
@@ -33,6 +35,17 @@ def _split_multiline(value):
 
 def _eprint(*args, **kwargs):
     print(*args, **kwargs, file=sys.stderr)
+
+def _patch_osx_compiler(compiler):
+    # On newer OSX, Python has been compiled as a universal binary, so
+    # it will attempt to pass universal binary flags when building the
+    # extension. This will not work because the code makes use of SSE2.
+    for tool in ("compiler", "compiler_so", "linker_so"):
+        flags = getattr(compiler, tool)
+        i = next((i for i in range(1, len(flags)) if flags[i-1] == "-arch" and flags[i] == "arm64"), None)
+        if i is not None:
+            flags.pop(i)
+            flags.pop(i-1)
 
 # --- `setup.py` commands ----------------------------------------------------
 
@@ -89,6 +102,7 @@ class build_ext(_build_ext):
                 "SYS_VERSION_INFO_MAJOR": sys.version_info.major,
                 "SYS_VERSION_INFO_MINOR": sys.version_info.minor,
                 "SYS_VERSION_INFO_MICRO": sys.version_info.micro,
+                "SYS_BYTEORDER": sys.byteorder,
             }
         }
         if hmmer_impl is not None:
@@ -141,6 +155,10 @@ class build_ext(_build_ext):
         else:
             ext.define_macros.append(("CYTHON_WITHOUT_ASSERTIONS", 1))
 
+        # remove universal binary CFLAGS from the compiler if any
+        if platform.system() == "Darwin":
+            _patch_osx_compiler(self.compiler)
+
         # update link and include directories
         ext.include_dirs.append(self._clib_cmd.build_clib)
         ext.library_dirs.append(self._clib_cmd.build_clib)
@@ -162,6 +180,48 @@ class configure(_build_clib):
     the same configuration values (`self.build_temp`, `self.build_clib`, etc).
     """
 
+    _FUNCTION_HEADERS = {
+        "_mm_malloc": ["malloc.h"],
+        "aligned_alloc": ["stdlib.h"],
+        "chmod": ["sys/stat.h", "stddef.h"],
+        "erfc": ["math.h"],
+        "fstat": ["sys/stat.h", "stddef.h"],
+        "fseeko": ["stdio.h"],
+        "getcwd": ["unistd.h"],
+        "getpid": ["unistd.h"],
+        "mkstemp": ["stdlib.h"],
+        "popen": ["stdio.h"],
+        "posix_memalign": ["stdlib.h"],
+        "putenv": ["stdlib.h"],
+        "strcasecmp": ["strings.h", "stddef.h"],
+        "stat": ["sys/stat.h", "stddef.h"],
+        "strsep": ["string.h"],
+        "sysconf": ["unistd.h"],
+        "sysctl": ["sys/types.h", "sys/sysctl.h", "stddef.h"],
+        "times": ["sys/times.h", "stddef.h"],
+    }
+
+    _FUNCTION_ARGUMENTS = {
+        "_mm_malloc": ["0", "0"],
+        "aligned_alloc": ["0", "0"],
+        "chmod": ["NULL", "0"],
+        "erfc": ["0"],
+        "fstat": ["1", "NULL"],
+        "fseeko": ["NULL", "0", "0"],
+        "getcwd": ["NULL", "0"],
+        "getpid": [],
+        "mkstemp": ["NULL"],
+        "popen": ["NULL", "NULL"],
+        "posix_memalign": ["NULL", "0", "0"],
+        "putenv": ["NULL"],
+        "strcasecmp": ["NULL", "NULL"],
+        "stat": ["NULL", "NULL"],
+        "strsep": ["NULL", "NULL"],
+        "sysconf": ["0"],
+        "sysctl": ["NULL", "0", "NULL", "NULL", "NULL", "0"],
+        "times": ["NULL"],
+    }
+
     # --- Compatibility with base `build_clib` command ---
 
     def check_library_list(self, libraries):
@@ -175,12 +235,6 @@ class configure(_build_clib):
 
     # --- Autotools-like helpers ---
 
-    def _silent_spawn(self, cmd):
-        try:
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as err:
-            raise CompileError(err.stderr)
-
     def _has_header(self, headername):
         _eprint('checking whether <{}> can be included'.format(headername), end="... ")
 
@@ -191,9 +245,8 @@ class configure(_build_clib):
         with open(testfile, "w") as f:
             f.write('#include "{}"\n'.format(headername))
         try:
-            with mock.patch.object(self.compiler, "spawn", new=self._silent_spawn):
-                objects = self.compiler.compile([testfile], debug=self.debug)
-        except CompileError as err:
+            objects = self.compiler.compile([testfile], debug=self.debug)
+        except (CompileError, LinkError) as err:
             _eprint("no")
             return False
         else:
@@ -212,12 +265,16 @@ class configure(_build_clib):
         objects = []
 
         with open(testfile, "w") as f:
-            f.write('int main() {{return {}(); return 0;}}\n'.format(funcname))
+            for header in self._FUNCTION_HEADERS[funcname]:
+                f.write("#include <{}>\n".format(header))
+            f.write("int main() {{ {}({}); return 0; }}".format(
+                funcname,
+                ', '.join(self._FUNCTION_ARGUMENTS[funcname]),
+            ))
         try:
-            with mock.patch.object(self.compiler, "spawn", new=self._silent_spawn):
-                objects = self.compiler.compile([testfile], debug=self.debug)
-                self.compiler.link_executable(objects, binfile)
-        except CompileError:
+            objects = self.compiler.compile([testfile], debug=self.debug, extra_postargs=["-Wno-all"])
+            self.compiler.link_executable(objects, binfile)
+        except (CompileError, LinkError) as err:
             _eprint("no")
             return False
         else:
@@ -247,11 +304,10 @@ class configure(_build_clib):
                 }
             """)
         try:
-            with mock.patch.object(self.compiler, "spawn", new=self._silent_spawn):
-                objects = self.compiler.compile([testfile], debug=self.debug, extra_preargs=["-msse2"])
-                self.compiler.link_executable(objects, binfile)
-                subprocess.run([binfile], check=True)
-        except CompileError:
+            objects = self.compiler.compile([testfile], debug=self.debug, extra_preargs=["-msse2"])
+            self.compiler.link_executable(objects, binfile)
+            subprocess.run([binfile], check=True)
+        except (CompileError, LinkError):
             _eprint("no")
             return False
         except subprocess.CalledProcessError:
@@ -285,11 +341,10 @@ class configure(_build_clib):
                 }
             """)
         try:
-            with mock.patch.object(self.compiler, "spawn", new=self._silent_spawn):
-                objects = self.compiler.compile([testfile], debug=self.debug)
-                self.compiler.link_executable(objects, binfile)
-                subprocess.run([binfile], check=True)
-        except CompileError:
+            objects = self.compiler.compile([testfile], debug=self.debug)
+            self.compiler.link_executable(objects, binfile)
+            subprocess.run([binfile], check=True)
+        except (CompileError, LinkError):
             _eprint('no')
             return False
         except subprocess.CalledProcessError:
@@ -315,6 +370,10 @@ class configure(_build_clib):
 
         # ensure the output directory exists, otherwise create it
         self.mkpath(self.build_clib)
+
+        # remove universal binary CFLAGS from the compiler if any
+        if platform.system() == "Darwin":
+            _patch_osx_compiler(self.compiler)
 
         # run the `configure_library` method sequentially on each library,
         # unless the header already exists and the configuration has not
@@ -409,10 +468,20 @@ class build_clib(_build_clib):
 
     # --- Distutils command interface ---
 
+    user_options = _build_clib.user_options + [
+        ("parallel", "j", "number of parallel build jobs"),
+    ]
+
+    def initialize_options(self):
+        _build_clib.initialize_options(self)
+        self.parallel = None
+
     def finalize_options(self):
         _build_clib.finalize_options(self)
         self._configure_cmd = self.get_finalized_command("configure")
         self._configure_cmd.force = self.force
+        if self.parallel is not None:
+            self.parallel = int(self.parallel)
 
     # --- Compatibility with base `build_clib` command ---
 
@@ -459,6 +528,10 @@ class build_clib(_build_clib):
         _build_clib.run(self)
 
     def build_libraries(self, libraries):
+        # remove universal binary CFLAGS from the compiler if any
+        if platform.system() == "Darwin":
+            _patch_osx_compiler(self.compiler)
+        # build extensions sequentially
         self.mkpath(self.build_clib)
         for library in libraries:
             self.make_file(
@@ -478,16 +551,32 @@ class build_clib(_build_clib):
             elif self.compiler.compiler_type == "msvc":
                 library.extra_compile_args.append("/Od")
 
-        # build objects and create a static library
-        objects = self.compiler.compile(
-            library.sources,
-            output_dir=self.build_temp,
-            include_dirs=library.include_dirs + [self.build_clib],
-            macros=library.define_macros,
-            debug=self.debug,
-            depends=library.depends,
-            extra_preargs=library.extra_compile_args,
+        # store compile args
+        compile_args = (
+            self.build_temp,
+            library.define_macros,
+            library.include_dirs + [self.build_clib],
+            self.debug,
+            library.extra_compile_args,
+            None,
+            library.depends,
         )
+
+        # manually prepare sources and get the names of object files
+        sources = library.sources.copy()
+        objects = [
+            os.path.join(self.build_temp, s.replace(".c", self.compiler.obj_extension))
+            for s in sources
+        ]
+
+        # compile outdated files in parallel
+        with multiprocessing.pool.ThreadPool(self.parallel) as pool:
+            pool.starmap(
+                functools.partial(self._compile_file, compile_args=compile_args),
+                zip(sources, objects)
+            )
+
+        # create a static library
         self.compiler.create_static_lib(
             objects,
             library.name,
@@ -500,6 +589,14 @@ class build_clib(_build_clib):
             lines = f.readlines()
         with open(new, "w") as f:
             f.writelines(l.replace("static ", "") for l in lines)
+
+    def _compile_file(self, source, object, compile_args):
+        self.make_file(
+            [source],
+            object,
+            self.compiler.compile,
+            ([source], *compile_args)
+        )
 
 
 class clean(_clean):

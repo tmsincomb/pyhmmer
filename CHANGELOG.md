@@ -6,7 +6,116 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 
 ## [Unreleased]
-[Unreleased]: https://github.com/althonos/pyhmmer/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/althonos/pyhmmer/compare/v0.7.2...HEAD
+
+
+## [v0.7.2] - 2023-02-17
+[v0.7.2]: https://github.com/althonos/pyhmmer/compare/v0.7.1...v0.7.2
+
+### Added
+- `easel.GeneticCode` class wrapping an `ESL_GENCODE` struct for configuring translation.
+- `DigitalSequence.translate` method to translate a nucleotide sequence to a protein sequence. Metadata is copied from the source sequence to its translation ([#31](https://github.com/althonos/pyhmmer/pull/31), by [@valentynbez](https://github.com/valentynbez)).
+
+### Deprecated
+- `Sequence.taxonomy_id` property, as it is not used by Easel and implementation is not consistent (see [EddyRivasLab/easel#68](https://github.com/EddyRivasLab/easel/issues/68)).
+
+
+## [v0.7.1] - 2022-12-15
+[v0.7.1]: https://github.com/althonos/pyhmmer/compare/v0.7.0...v0.7.1
+
+### Added
+- Missing `__reduce__` method to `TopHits`.
+
+### Fixed
+- Build detection of available platform functions in `setup.py`.
+
+
+## [v0.7.0] - 2022-12-04
+[v0.7.0]: https://github.com/althonos/pyhmmer/compare/v0.6.3...v0.7.0
+
+### Added
+- `Bitfield.zeros` and `Bitfield.ones` classmethods for constructing an empty bitfield of known size.
+- `Bitfield.copy` method to copy a bitfield object.
+- `SequenceBlock` and `OptimizedProfileBlock` classes to store Python objects next to a contiguous array of pointers for iterating with the GIL released.
+- `SequenceFile.read_block` method to read a whole sequence block from a file.
+- `HMM.sample` class method to generate a HMM at random given a `Randomness` source.
+- `hmmscan` function to scan a profile database with sequence queries.
+- `deepcopy` implementations to `HMM`, `Profile` and `OptimizedProfile` classes of `plan7`.
+- `rewind` method to `HMMFile`, `HMMPressedFile` and `SequenceFile` to reset a file back to its initial position.
+- `name` attribute to `HMMFile`, `HMMPressedFile`, `MSAFile` and `SequenceFile` to expose the path of a file (when it was created from path).
+- `local` property to `Profile` and `OptimizedProfile`, indicating whether a profile is in local or global mode.
+- `multihit` property to `Profile` and `OptimizedProfile`, indicating whether a profile is in unihit or multihit mode, with a setter taking care of the reconfiguration.
+- `Domain.included` and `Domain.reported` settable properties to report the inclusion and reporting status of a single domain. 
+- `TopHits.included` and `TopHits.reported` sized iterator to iterate only on included and reported hits.
+- `Domains.included` and `Domains.reported` sized iterator to iterate only on included and reported domains.
+
+### Changed
+- `Bitfield`, `Vector` and `Matrix` can now be created from an iterable.
+- `Pipeline` search methods now expect a `DigitalSequenceBlock` or a `SequenceFile` for the target sequence database.
+- `Pipeline` scan methods now expect an `OptimizedProfileBlock` or a `HMMPressedFile` for the target profile database.
+- `TraceAligner` now expect a `DigitalSequenceBlock` for the sequences to align to the HMM.
+- `Profile.configure` now uses a default value of 400 for the `L` argument.
+- `hmmsearch`, `nhmmer` and `phmmer` support being given a single query instead of requiring an iterable.
+- `HMMPressedFile` can now be created, closed and used as a context manager directly without having to manage the source `HMMFile`.
+- Renamed `Profile.optimized` method to `Profile.to_optimized`.
+- Replaced `Randomness.is_fast` method with the `Randomness.fast` property.
+- Rewrite handling of `Hit` flags using settable properties (`Hit.included`, `Hit.reported`, `Hit.new`, `Hit.dropped`, `Hit.duplicate`) instead of methods.
+
+### Fixed
+- Memory leak in the `LongTargetsPipeline` search loop.
+- PyPy behaviour change of `readinto` methods now expecting `unsigned char*` instead of `char*` memoryview.
+- `NULL`-pointer dereference in `Pipeline.search_hmm` when given a query without name.
+- `LongTargetsPipeline` not recording the query name and accession.
+- Memory leak caused by using a non-default prior scheme when constructing a `Builder`.
+
+### Removed
+- `PipelineSearchTargets`, replaced in functionality with `easel.DigitalSequenceBlock`.
+- `is_local` and `is_multihit` methods of `Profile` and `OptimizedProfile`, replaced with equivalent properties.
+- `Hit.manually_drop` and `Hit.manually_include` methods, replaced with the different `Hit` properties.
+
+
+## [v0.6.3] - 2022-09-09
+[v0.6.3]: https://github.com/althonos/pyhmmer/compare/v0.6.2...v0.6.3
+
+### Fixed
+- Error not being raised on alphabet detection failure in `SequenceFile` or `MSAFile`.
+- Add check in `DigitalSequence` constructor to make sure encoded characters are in valid range ([#25](https://github.com/althonos/pyhmmer/issues/25)).
+
+### Added
+- `SequenceFile.guess_alphabet` and `MSAFile.guess_alphabet` to guess the alphabet from an open file.
+- `Alphabet.encode` and `Alphabet.decode` to convert raw sequences between digital and text format.
+
+
+## [v0.6.2] - 2022-08-12
+[v0.6.2]: https://github.com/althonos/pyhmmer/compare/v0.6.1...v0.6.2
+
+### Changed
+- `hmmsearch`, `phmmer` and `nhmmer` functions will reduce the requested number of threads to the number of queries, if it can be detected using `operator.length_hint`.
+
+### Added
+- Documentation for loading all HMMs from an `HMMFile` object at once ([#23](https://github.com/althonos/pyhmmer/issues/23)).
+- List of projects depending on PyHMMER to the `Examples` page of the documentation.
+
+
+## [v0.6.1] - 2022-06-28
+[v0.6.1]: https://github.com/althonos/pyhmmer/compare/v0.6.0...v0.6.1
+
+### Added
+- `pickle` protocol support for `TopHits` objects, using the HMMER network serialization.
+- `TopHits.write` method to write hits to a file in tabular format.
+- `query_name` and `query_accession` properties to `TopHits` objects to access the name and accession of the query that produced the hits.
+
+### Fixed
+- Extraction of filename from file-like objects in the `HMMFile` constructor.
+- Use `os.cpu_count` instead of `multiprocessing.cpu_count` where applicable to preserve OS scheduling.
+- Wrong return type in docstring of `HMM.insert_emissions`.
+- `TopHits.searched_nodes` returning the searched number of residues instead of the searched number of model nodes.
+- Unsound decoding of pickled `MatrixF` or `VectorF` when data comes from a source of different endianness.
+
+### Changed
+- Rewrite `pyhmmer.hmmer` threading code using `Deque` instead of `collections.Queue` to store the queries and results.
+- Reduce memory consumption of `pyhmmer.hmmer` by reducing the number of semaphores and event flags used concurrently.
+- Make `pyhmmer.hmmer` main threads block on query insertion rather than result retrieval to make sure worker threads are never idling.
 
 
 ## [v0.6.0] - 2022-05-01

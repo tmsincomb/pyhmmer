@@ -28,18 +28,18 @@ jobs:
         - python-version: '3.10'
           pyo3-python: /opt/python/cp310-cp310/bin/python
           manylinux-img: quay.io/pypa/manylinux_2_24_x86_64
-        - python-version: pypy-3.6
-          pyo3-python: /opt/pypy/pypy3.6-7.3.3/bin/python
-          manylinux-img: pypywheels/manylinux2010-pypy_x86_64
+        - python-version: '3.11'
+          pyo3-python: /opt/python/cp311-cp311/bin/python
+          manylinux-img: quay.io/pypa/manylinux_2_24_x86_64
         - python-version: pypy-3.7
-          pyo3-python: /opt/pypy/pypy3.7-7.3.4/bin/python
-          manylinux-img: pypywheels/manylinux2010-pypy_x86_64
+          pyo3-python: /opt/python/pp37-pypy37_pp73/bin/python
+          manylinux-img: quay.io/pypa/manylinux_2_24_x86_64
         - python-version: pypy-3.8
-          pyo3-python: /opt/pypy/pypy3.7-7.3.4/bin/python
-          manylinux-img: pypywheels/manylinux2010-pypy_x86_64
+          pyo3-python: /opt/python/pp38-pypy38_pp73/bin/python
+          manylinux-img: quay.io/pypa/manylinux_2_24_x86_64
         - python-version: pypy-3.9
-          pyo3-python: /opt/pypy/pypy3.7-7.3.4/bin/python
-          manylinux-img: pypywheels/manylinux2010-pypy_x86_64
+          pyo3-python: /opt/python/pp39-pypy39_pp73/bin/python
+          manylinux-img: quay.io/pypa/manylinux_2_24_x86_64
     steps:
     - name: Checkout code
       uses: actions/checkout@v2
@@ -69,11 +69,11 @@ jobs:
     strategy:
       matrix:
         python-version:
-        - 3.6
         - 3.7
         - 3.8
         - 3.9
         - '3.10'
+        - '3.11'
     steps:
     - name: Setup Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
@@ -99,11 +99,11 @@ jobs:
     strategy:
       matrix:
         python-version:
-        - 3.6
         - 3.7
         - 3.8
         - 3.9
         - '3.10'
+        - '3.11'
         - pypy-3.7
         - pypy-3.8
         - pypy-3.9
@@ -148,11 +148,11 @@ jobs:
     strategy:
       matrix:
         python-version:
-        - 3.6
         - 3.7
         - 3.8
         - 3.9
         - '3.10'
+        - '3.11'
         - pypy-3.7
         - pypy-3.8
         - pypy-3.9
@@ -238,6 +238,7 @@ jobs:
   aur:
     environment: Arch Linux User Repository
     runs-on: ubuntu-latest
+    if: "!contains(github.ref, 'rc')"
     name: Update AUR package
     needs:
     - sdist
