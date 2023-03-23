@@ -15,6 +15,7 @@ HMMER internals, which has several advantages over CLI wrappers like
 import collections.abc as _collections_abc
 import contextlib as _contextlib
 import os as _os
+import warnings as _warnings
 
 from . import errors
 from . import easel
@@ -26,7 +27,7 @@ from .hmmer import hmmalign, hmmsearch, hmmpress, nhmmer, hmmscan, phmmer
 
 __author__ = "Martin Larralde <martin.larralde@embl.de>"
 __license__ = "MIT"
-__version__ = "0.7.3"
+__version__ = "0.7.3+neon"
 __all__ = [
     "errors",
     "easel",
@@ -67,3 +68,11 @@ if hasattr(_contextlib, "AbstractContextManager"):
     _contextlib.AbstractContextManager.register(easel.SSIReader)
     _contextlib.AbstractContextManager.register(easel.SSIWriter)
     _contextlib.AbstractContextManager.register(plan7.HMMFile)
+
+_warnings.warn(
+    "You are importing the experimental Arm64 branch of PyHMMER, "
+    "based on the develop branch of HMMER (3.3.2+eab5d49). "
+    "No guarantee is made about stability or compatibility with "
+    "the stable HMMER release (3.3.2). Use at your own risk.",
+    ImportWarning,
+)
