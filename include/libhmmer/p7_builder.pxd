@@ -1,5 +1,6 @@
 from libc.stdint cimport uint8_t, uint32_t, int64_t
 
+from libeasel cimport eslERRBUFSIZE
 from libeasel.alphabet cimport ESL_ALPHABET
 from libeasel.dmatrix cimport ESL_DMATRIX
 from libeasel.getopts cimport ESL_GETOPTS
@@ -22,8 +23,6 @@ ELIF HMMER_IMPL == "NEON":
 
 
 cdef extern from "hmmer.h" nogil:
-
-    DEF eslERRBUFSIZE = 128
 
     cdef double p7_DEFAULT_WINDOW_BETA
 

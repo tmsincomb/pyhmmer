@@ -67,7 +67,7 @@ from libeasel.fileparser cimport ESL_FILEPARSER
 from libhmmer cimport p7_LOCAL, p7_EVPARAM_UNSET, p7_CUTOFF_UNSET, p7_NEVPARAM, p7_NCUTOFFS, p7_offsets_e, p7_cutoffs_e, p7_evparams_e
 from libhmmer.logsum cimport p7_FLogsumInit
 from libhmmer.p7_builder cimport P7_BUILDER, p7_archchoice_e, p7_wgtchoice_e, p7_effnchoice_e
-from libhmmer.p7_hmm cimport p7H_NTRANSITIONS, p7H_TC, p7H_GA, p7H_NC, p7H_MAP
+from libhmmer.p7_hmm cimport p7H_NTRANSITIONS, p7H_TC, p7H_GA, p7H_NC, p7H_MAP, p7h_transitions_e
 from libhmmer.p7_hmmfile cimport p7_hmmfile_formats_e
 from libhmmer.p7_hit cimport p7_hitflags_e, P7_HIT
 from libhmmer.p7_alidisplay cimport P7_ALIDISPLAY
@@ -2163,6 +2163,20 @@ cdef class HMM:
 
     # --- Magic methods ------------------------------------------------------
 
+    cdef void _initialize(self) nogil:
+        cdef int i
+        cdef int j
+        cdef int K = self.alphabet._abc.K
+        for i in range(self._hmm.M+1):
+            libeasel.vec.esl_vec_FSet(self._hmm.mat[i], K, 0.0)
+            libeasel.vec.esl_vec_FSet(self._hmm.ins[i], K, 0.0)
+            libeasel.vec.esl_vec_FSet(self._hmm.t[i], p7H_NTRANSITIONS, 0.0)
+            self._hmm.mat[i][0] = 1.0
+            self._hmm.ins[i][0] = 1.0
+            self._hmm.t[i][<int> p7h_transitions_e.p7H_MM] = 1.0
+            self._hmm.t[i][<int> p7h_transitions_e.p7H_IM] = 1.0
+            self._hmm.t[i][<int> p7h_transitions_e.p7H_DM] = 1.0
+
     def __cinit__(self):
         self.alphabet = None
         self._hmm = NULL
@@ -2184,6 +2198,12 @@ cdef class HMM:
             self._hmm = libhmmer.p7_hmm.p7_hmm_Create(M, alphabet._abc)
         if not self._hmm:
             raise AllocationError("P7_HMM", sizeof(P7_HMM))
+
+        # initialize HMM with arbitrary probabilities so that the HMM
+        # is valid and doesn't crash if used as-is (see #36).
+        with nogil:
+            self._initialize()
+
         # FIXME(@althonos): Remove following block when
         # https://github.com/EddyRivasLab/hmmer/pull/236
         # is merged and released in a new HMMER version
@@ -3309,9 +3329,9 @@ cdef class HMMFile:
                 pressed HMM database if it finds one. Defaults to `True`.
 
         """
-        cdef int       status
-        cdef bytes     fspath
-        cdef bytearray errbuf = bytearray(eslERRBUFSIZE)
+        cdef int                 status
+        cdef bytes               fspath
+        cdef char[eslERRBUFSIZE] errbuf
 
         try:
             fspath = os.fsencode(file)
@@ -3907,9 +3927,9 @@ cdef class OptimizedProfile:
         if not isinstance(other, OptimizedProfile):
             return NotImplemented
 
-        cdef OptimizedProfile op     = <Profile> other
-        cdef bytearray        errbuf = bytearray(eslERRBUFSIZE)
-        cdef int              status = p7_oprofile_Compare(self._om, op._om, 0.0, errbuf)
+        cdef char[eslERRBUFSIZE] errbuf
+        cdef OptimizedProfile    op     = <Profile> other
+        cdef int                 status = p7_oprofile_Compare(self._om, op._om, 0.0, errbuf)
 
         if status == libeasel.eslOK:
             return True
@@ -7934,7 +7954,7 @@ cdef class TopHits:
             alphabet (`~pyhmmer.easel.Alphabet`): The alphabet of the
                 HMM this `TopHits` was obtained from. It is required to
                 convert back hits to single sequences.
-            sequences (`list` of `~pyhmmer.easel.Sequence`, optional): A list 
+            sequences (`list` of `~pyhmmer.easel.Sequence`, optional): A list
                 of additional sequences to include in the alignment.
             traces (`list` of `~plan7.Trace`, optional): A list of
                 additional traces to include in the alignment.
@@ -7943,7 +7963,7 @@ cdef class TopHits:
             trim (`bool`): Trim off any residues that get assigned to
                 flanking :math:`N` and :math:`C` states (in profile traces)
                 or :math:`I_0` and :math:`I_m` (in core traces).
-            digitize (`bool`): If set to `True`, returns a  `DigitalMSA` 
+            digitize (`bool`): If set to `True`, returns a  `DigitalMSA`
                 instead of a `TextMSA`.
             all_consensus_cols (`bool`): Force a column to be created for
                 every consensus column in the model, even if it means having
@@ -7951,8 +7971,8 @@ cdef class TopHits:
 
         Returns:
             `~pyhmmer.easel.MSA`: A multiple sequence alignment containing
-            the reported hits, either a `~pyhmmer.easel.TextMSA` or a 
-            `~pyhmmer.easel.DigitalMSA` depending on the value of the 
+            the reported hits, either a `~pyhmmer.easel.TextMSA` or a
+            `~pyhmmer.easel.DigitalMSA` depending on the value of the
             ``digitize`` argument.
 
         .. versionadded:: 0.3.0
@@ -8422,11 +8442,12 @@ cdef class TraceAligner:
             Targets must now be inside a `~pyhmmer.easel.DigitalSequenceBlock`.
 
         """
-        cdef int             status
-        cdef ssize_t         i
-        cdef Trace           trace
-        cdef Traces          traces = Traces()
-        cdef ssize_t         nseq   = len(sequences)
+        cdef int                 status
+        cdef ssize_t             i
+        cdef Trace               trace
+        cdef Traces              traces = Traces()
+        cdef ssize_t             nseq   = len(sequences)
+        cdef char[eslERRBUFSIZE] errbuf
 
         if nseq < 0:
             raise ValueError("Cannot compute traces for a negative number of sequences")
@@ -8436,6 +8457,10 @@ cdef class TraceAligner:
         # check alphabet
         if not hmm.alphabet._eq(sequences.alphabet):
             raise AlphabetMismatch(hmm.alphabet, sequences.alphabet)
+        # check HMM validity, otherwise the function may segfault
+        if libhmmer.p7_hmm.p7_hmm_Validate(hmm._hmm, errbuf, 1e-3) != libeasel.eslOK:
+            err_msg = errbuf.decode("utf-8", "replace")
+            raise ValueError(f"Invalid HMM: {err_msg}")
 
         # allocate the return array of traces and create empty traces
         traces._ntraces = nseq
@@ -8494,8 +8519,8 @@ cdef class TraceAligner:
 
         Returns:
             `~pyhmmer.easel.MSA`: A multiple sequence alignment containing
-            the aligned sequences, either a `~pyhmmer.easel.TextMSA` or a 
-            `~pyhmmer.easel.DigitalMSA` depending on the value of the 
+            the aligned sequences, either a `~pyhmmer.easel.TextMSA` or a
+            `~pyhmmer.easel.DigitalMSA` depending on the value of the
             ``digitize`` argument.
 
         Raises:
@@ -8506,12 +8531,13 @@ cdef class TraceAligner:
             Targets must now be inside a `~pyhmmer.easel.DigitalSequenceBlock`.
 
         """
-        cdef int             status
-        cdef size_t          i
-        cdef MSA             msa
-        cdef ssize_t         nseq   = len(sequences)
-        cdef ssize_t         ntr    = len(traces)
-        cdef int             flags  = 0
+        cdef size_t              i
+        cdef MSA                 msa
+        cdef int                 status
+        cdef char[eslERRBUFSIZE] errbuf
+        cdef ssize_t             nseq   = len(sequences)
+        cdef ssize_t             ntr    = len(traces)
+        cdef int                 flags  = 0
 
         # check optional flags and prepare the returned MSA
         if trim:
@@ -8535,6 +8561,10 @@ cdef class TraceAligner:
         # check alphabet
         if not hmm.alphabet._eq(sequences.alphabet):
             raise AlphabetMismatch(hmm.alphabet, sequences.alphabet)
+        # check HMM validity, otherwise the function may segfault
+        if libhmmer.p7_hmm.p7_hmm_Validate(hmm._hmm, errbuf, 1e-3) != libeasel.eslOK:
+            err_msg = errbuf.decode("utf-8", "replace")
+            raise ValueError(f"Invalid HMM: {err_msg}")
 
         # make the alignments
         with nogil:

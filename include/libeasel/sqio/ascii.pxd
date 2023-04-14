@@ -2,7 +2,7 @@ from libc.stdint cimport int32_t, int64_t, uint32_t
 from libc.stdio cimport FILE
 from posix.types cimport off_t
 
-from libeasel cimport ESL_DSQ
+from libeasel cimport ESL_DSQ, eslERRBUFSIZE
 from libeasel.msa cimport ESL_MSA
 from libeasel.msafile cimport ESL_MSAFILE
 from libeasel.sq cimport ESL_SQ
@@ -10,12 +10,8 @@ from libeasel.sqio cimport esl_sqio_s
 from libeasel.ssi cimport ESL_SSI
 
 
-cdef extern from "easel.h":
-    DEF eslERRBUFSIZE = 128
-
-
 cdef extern from "esl_sqio.h" nogil:
-    DEF MAX_RESIDUE_COUNT = 1024*1024
+    const size_t MAX_RESIDUE_COUNT
 
     ctypedef esl_sqascii_s ESL_SQASCII_DATA
     cdef struct esl_sqascii_s:

@@ -1,6 +1,7 @@
 from libc.stdint cimport uint64_t, int64_t
 from libc.stdio cimport FILE
 
+from libeasel cimport eslERRBUFSIZE
 from libeasel.sq cimport ESL_SQ
 from libeasel.getopts cimport ESL_GETOPTS
 from libeasel.random cimport ESL_RANDOMNESS
@@ -20,11 +21,6 @@ ELIF HMMER_IMPL == "SSE":
 ELIF HMMER_IMPL == "NEON":
     from libhmmer.impl_neon.p7_omx cimport P7_OMX
     from libhmmer.impl_neon.p7_oprofile cimport P7_OPROFILE
-
-
-cdef extern from "easel.h" nogil:
-
-    DEF eslERRBUFSIZE = 128
 
 
 cdef extern from "hmmer.h" nogil:
